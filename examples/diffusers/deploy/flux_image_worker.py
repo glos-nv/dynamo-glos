@@ -16,7 +16,8 @@
 """FLUX.2-klein diffusers example worker for Dynamo's /v1/images endpoints.
 
 Serves text-to-image and image-to-image (reference-image editing) from a single
-``Flux2KleinPipeline``, with a BF16 or NVFP4 (``--precision nvfp4``) transformer.
+``Flux2KleinPipeline``, with a BF16, FP16, FP8, or NVFP4 transformer.
+``--precision fp4`` is an alias for ``nvfp4``. The text encoder and VAE stay BF16.
 It registers as ``ModelType.Images`` so the stock Dynamo frontend exposes:
 
 * ``POST /v1/images/generations`` -- text-to-image, or image-to-image when the
@@ -46,8 +47,6 @@ from typing import Any
 
 import torch
 import uvloop
-from PIL import Image
-
 from dynamo.common.multimodal import ImageLoader
 from dynamo.common.protocols.image_protocol import (
     ImageAccounting,
@@ -64,6 +63,8 @@ from dynamo.llm import (  # type: ignore[attr-defined]
 )
 from dynamo.llm.exceptions import InvalidArgument, WorkerOverloaded
 from dynamo.runtime import DistributedRuntime, dynamo_endpoint
+from flux_precision import PRECISIONS, check_precision_support, prepare_transformer
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,8 @@ def _get_worker_namespace() -> str:
 
 
 class FluxImageBackend:
+    """Serve one FLUX pipeline, serializing GPU work on a dedicated thread."""
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.model_name: str = args.served_model_name or args.model
@@ -105,6 +108,7 @@ class FluxImageBackend:
         self._request_task: asyncio.Task[dict[str, Any]] | None = None
 
     async def initialize_model(self) -> None:
+        """Load, optionally tune, and warm up the pipeline before registration."""
         loop = asyncio.get_running_loop()
         self.pipe = await loop.run_in_executor(self._executor, self._load)
         if self.args.warmup > 0:
@@ -112,6 +116,7 @@ class FluxImageBackend:
         logger.info("Pipeline ready (%s)", self.model_name)
 
     async def close(self) -> None:
+        """Drain an in-flight request before shutting down the inference thread."""
         if self._request_task is not None:
             await asyncio.gather(self._request_task, return_exceptions=True)
         await asyncio.to_thread(self._executor.shutdown, wait=True)
@@ -122,9 +127,11 @@ class FluxImageBackend:
             task.exception()
 
     def _load(self) -> Any:
+        """Load the chosen precision and optionally select a validated backend."""
         from diffusers import Flux2KleinPipeline
 
-        if self.args.precision == "nvfp4":
+        check_precision_support(self.args.precision)
+        if self.args.precision in ("fp4", "nvfp4"):
             # NVFP4 transformer (Blackwell FP4 tensor cores); the text encoder
             # and VAE stay BF16 and come from the base model.
             from huggingface_hub import hf_hub_download
@@ -143,8 +150,23 @@ class FluxImageBackend:
             )
         pipe = pipe.to("cuda")
         pipe.set_progress_bar_config(disable=True)
+        prepare_transformer(pipe.transformer, self.args.precision)
 
-        if self.args.torch_compile:
+        if self.args.use_aitune:
+            # Keep AI Tune optional for the original worker launch path.
+            from flux_aitune import tune_transformer
+
+            width, height = self._parse_size(self.args.default_size)
+            tune_transformer(
+                pipe,
+                width=width,
+                height=height,
+                steps=self.args.default_num_inference_steps,
+                guidance_scale=self.args.default_guidance_scale,
+                max_image_side=self.args.max_image_side,
+                size_multiple=SIZE_MULTIPLE,
+            )
+        elif self.args.torch_compile:
             logger.info(
                 "torch.compile(transformer.forward, mode=%s)",
                 self.args.torch_compile_mode,
@@ -171,7 +193,7 @@ class FluxImageBackend:
         return pipe
 
     def _warmup(self) -> None:
-        """Pay the torch.compile cost for both t2i and i2i before serving."""
+        """Warm generation and editing, including any deferred JIT compilation."""
         width, height = self._parse_size(self.args.default_size)
         blank = Image.new("RGB", (width, height), (127, 127, 127))
         modes = [("t2i", None)]
@@ -225,14 +247,14 @@ class FluxImageBackend:
         guidance_scale: float,
         seed: int | None,
     ) -> Image.Image:
-        kwargs: dict[str, Any] = dict(
-            prompt=prompt,
-            width=width,
-            height=height,
-            num_inference_steps=steps,
-            guidance_scale=guidance_scale,
-            output_type="pil",
-        )
+        kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "output_type": "pil",
+        }
         if image is not None:
             kwargs["image"] = image
         if seed is not None:
@@ -372,7 +394,7 @@ async def _register_model(endpoint, model_name: str) -> None:
         )
         logger.info("Successfully registered model: %s", model_name)
     except Exception as e:
-        logger.error("Failed to register model: %s", e, exc_info=True)
+        logger.exception("Failed to register model")
         raise RuntimeError("Model registration failed") from e
 
 
@@ -416,9 +438,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--precision",
-        choices=("bf16", "nvfp4"),
+        choices=PRECISIONS,
         default="bf16",
-        help="Transformer precision. nvfp4 needs Blackwell and torchao.",
+        help=(
+            "Transformer precision. fp8 needs Ada or newer and torchao; "
+            "fp4 is an alias for nvfp4 and needs Blackwell and torchao. "
+            "The text encoder and VAE stay BF16."
+        ),
+    )
+    parser.add_argument(
+        "--use-aitune",
+        action="store_true",
+        help="Tune the loaded transformer with AoT and JIT backends before serving (any precision).",
     )
     parser.add_argument(
         "--torch-compile",
@@ -451,6 +482,8 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_NUM_INFERENCE_STEPS,
     )
     args = parser.parse_args()
+    if args.use_aitune and args.torch_compile:
+        parser.error("--use-aitune and --torch-compile are mutually exclusive")
     for name in (
         "max_image_side",
         "max_num_inference_steps",
