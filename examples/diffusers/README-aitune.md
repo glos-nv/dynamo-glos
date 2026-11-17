@@ -77,6 +77,72 @@ transformer backend, including eager fallback if compilation fails.
 Ahead-of-time (AoT) input-shape bounds follow the
 worker's `--max-image-side` setting and include both generation and editing.
 
+### Check precisions and backends
+
+After building the image, open a container with an output directory mounted from
+the host. Run this on an idle GPU; each combination loads the full model and
+compilation can take several minutes.
+
+```bash
+mkdir -p precision-results
+docker run --rm -it --gpus all --shm-size 8g \
+  -v dynamo-flux2-klein-hf-cache:/root/.cache/huggingface \
+  -v "$(pwd)/precision-results:/results" \
+  dynamo-glos-flux2-klein:latest bash
+```
+
+Inside the container, run:
+
+```bash
+python deploy/check_precision_backends.py --output-dir /results
+```
+
+The script tests BF16, FP16, FP8, and FP4 (NVFP4), each against eager execution
+and every default candidate discovered from the installed AI Tune package.
+It isolates candidates for this diagnostic without overriding their compiler
+settings or changing normal service startup. Unsupported hardware combinations
+are marked `SKIP`, so FP4 is skipped on Ada.
+
+The table is printed after each combination and saved as `results.md` in a new
+timestamped directory under `precision-results` on the host. `results.json`
+also records the GPU, package versions, candidate configurations, timings, and
+errors. Each combination has its own `run.log`, AI Tune artifacts, and output PNGs.
+No frontend or HTTP service is started.
+
+The columns have distinct meanings:
+
+- **Compile**: `PASS` means AI Tune built, checked, profiled, and selected the
+  isolated candidate. This exercises deferred JIT compilation too. Eager fallback
+  is a failure for that candidate, and eager's own row shows `N/A`.
+- **Generation / Editing**: `PASS` means the selected backend produced and saved
+  that image. It does not establish numerical correctness.
+- **Validation**: `PASS` means the worker's generation, editing, and held-out
+  images passed the same-seed, same-precision eager comparison described below.
+  Eager's own row shows `N/A` and checks image dimensions and nonuniform pixels.
+- **Result**: the overall outcome, including loading failures. `NOT RUN` in a
+  stage means an earlier failure prevented that check. See the row's log for
+  the underlying error.
+
+The timeout defaults to 1,800 seconds per combination, including model loading.
+A failure or timeout does not stop subsequent combinations. Exit status is `1`
+if any combination failed, `2` for setup errors, and `130` for an interrupted run;
+completed and skipped results remain saved. Each combination uses a fresh AI Tune
+cache, while lower-level compiler caches and downloaded weights may be reused.
+
+To limit a run or identify individual default candidates:
+
+```bash
+python deploy/check_precision_backends.py --list-backends --output-dir /results
+python deploy/check_precision_backends.py --precisions fp8 fp4 --output-dir /results
+python deploy/check_precision_backends.py --precisions bf16 --backends eager --output-dir /results
+```
+
+`--backends` also accepts the numeric IDs printed by `--list-backends`. IDs
+distinguish different configurations of the same backend class. Use `--timeout`
+to allow longer compilation, or `--size` and `--steps` to change the workload
+(defaults: `1024x1024`, four steps). Results apply to the tested workload and
+environment, not all image sizes or GPU architectures.
+
 ### Details
 
 #### Build
