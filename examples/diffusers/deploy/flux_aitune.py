@@ -23,19 +23,7 @@ import logging
 import aitune.torch as ait
 import numpy as np
 import torch
-from aitune.torch.backend import (
-    BuildMode,
-    TorchEagerBackend,
-    TorchInductorAotBackend,
-    TorchInductorAotBackendConfig,
-    TorchInductorJitBackend,
-    TorchInductorJitBackendConfig,
-    TorchTensorRTAotBackend,
-    TorchTensorRTAotBackendConfig,
-    TorchTensorRTConfig,
-    TorchTensorRTJitBackend,
-    TorchTensorRTJitBackendConfig,
-)
+from aitune.torch.backend import TorchEagerBackend
 from aitune.torch.module.wrapper_module import ModuleState
 from aitune.torch.task.profiling import ProfilingConfig
 
@@ -71,9 +59,9 @@ def tune_transformer(
     """Replace ``pipe.transformer`` in place with a validated AI Tune module.
 
     The FLUX.2-klein pipeline must already be on CUDA with its selected precision
-    applied. Record generation and reference-image editing, then compare
-    TorchInductor and Torch-TensorRT in AoT and JIT modes at batch size one.
-    Prefer the fastest successful compiled candidate, even if eager is faster.
+    applied. Record generation and reference-image editing, then evaluate
+    AI Tune's default backend candidates at batch size one, without compiler
+    overrides. Prefer the fastest successful candidate, even if eager is faster.
     If every candidate fails, log an error and retain eager execution at the
     selected precision. Both compiled and eager selections undergo image checks.
 
@@ -92,7 +80,7 @@ def tune_transformer(
             selected backend's images fail validation against the eager baseline.
             These failures stop startup before model registration.
     """
-    logger.info("Optimizing the loaded transformer with AoT and JIT backends")
+    logger.info("Optimizing the loaded transformer with AI Tune's default backends")
 
     def generate(prompt, *, image=None, seed=42):
         return pipe(
@@ -119,49 +107,9 @@ def tune_transformer(
         (held_out, generate(**held_out)),
     ]
 
-    trt_config = TorchTensorRTConfig(
-        require_full_compilation=True,
-        # FLUX computes rotary frequencies in FP64; TRT needs FP32.
-        truncate_double=True,
-    )
-    # Quantization amplifies small changes in BF16 intermediates. Preserve eager
-    # rounding and kernel boundaries instead of relaxing output validation.
-    quantized = any(
-        p.dtype == torch.float8_e4m3fn for p in pipe.transformer.parameters()
-    )
-    inductor_options = (
-        {
-            "emulate_precision_casts": True,
-            "eager_numerics.division_rounding": True,
-            "eager_numerics.disable_ftz": True,
-            "max_fusion_size": 1,
-            "epilogue_fusion": False,
-            "prologue_fusion": False,
-        }
-        if quantized
-        else None
-    )
-    candidates = [
-        TorchInductorAotBackend(
-            # AOT packaging mutates this dictionary; do not share it with JIT.
-            TorchInductorAotBackendConfig(
-                inductor_configs=dict(inductor_options) if inductor_options else None
-            )
-        ),
-        TorchTensorRTAotBackend(
-            TorchTensorRTAotBackendConfig(compile_config=trt_config)
-        ),
-        TorchInductorJitBackend(
-            TorchInductorJitBackendConfig(options=inductor_options)
-        ),
-        TorchTensorRTJitBackend(
-            TorchTensorRTJitBackendConfig(compile_config=trt_config, fullgraph=True)
-        ),
-    ]
-    # Diagnostic mode prefers a successful compiled candidate, even if slower, but
+    # Diagnostic mode prefers a successful candidate, even if slower, but
     # restores the eager baseline when every candidate fails.
     strategy = ait.MinLatencyStrategy(
-        backends=candidates,
         profiling_config=ProfilingConfig(batch_sizes=[1], batching=False),
     ).enable_performance_validation("diagnostic")
     # One packed token per 16x16 pixels; editing concatenates image and reference.
@@ -191,40 +139,32 @@ def tune_transformer(
         generate(**editing)
 
     ait.tune(record_workload, [{}], batch_sizes=[1], ignore_failing_modules=False)
-    backends = _validate_backend_selection(pipe.transformer, strategy, candidates)
+    backends = _validate_backend_selection(pipe.transformer, strategy)
     for request, expected in validation_cases:
         _validate_image(generate(**request), expected)
     logger.info("Serving transformer: %s", [backend.describe() for backend in backends])
 
 
-def _validate_backend_selection(transformer, strategy, candidates):
+def _validate_backend_selection(transformer, strategy):
     """Return selected graph backends, logging candidate failures for eager graphs.
 
-    An eager selection is a supported fallback. An unfinished tuning state,
-    empty selection, or unexpected backend mode is a startup error.
+    An eager selection is a supported fallback. An unfinished tuning state or
+    empty selection is a startup error.
     """
     if transformer.state != ModuleState.TUNED:
         raise RuntimeError("AI Tune did not produce a tuned transformer")
     backends = list(transformer.module.backends.values())
     if not backends:
         raise RuntimeError("AI Tune did not select a transformer backend")
-    eager_count = 0
-    for backend in backends:
-        if isinstance(backend, TorchEagerBackend):
-            eager_count += 1
-        elif backend.build_mode not in (
-            BuildMode.AHEAD_OF_TIME,
-            BuildMode.JUST_IN_TIME,
-        ):
-            raise RuntimeError("AI Tune selected an unexpected backend")
+    eager_count = sum(isinstance(backend, TorchEagerBackend) for backend in backends)
     if eager_count:
-        error_logs = [
-            str(transformer.cache_dir / graph.name / candidate.key() / "build.log")
+        error_logs = sorted(
+            str(path)
             for graph in transformer.graph_specs
-            for candidate in candidates
-        ]
+            for path in (transformer.cache_dir / graph.name).glob("*/build.log")
+        )
         logger.error(
-            "Tuning failed: no AoT or JIT candidate succeeded for %d transformer graph(s). "
+            "Tuning failed: no optimization candidate succeeded for %d transformer graph(s). "
             "Falling back to eager execution with the selected precision unchanged. "
             "Candidate results: %s. Error logs: %s",
             eager_count,

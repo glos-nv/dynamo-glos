@@ -121,18 +121,18 @@ This permits Inductor export without converting the weights back to BF16, but
 prevents compiler fusion across those linear operations. Both precisions use
 the calibration scales saved in their checkpoints. `fp8` downloads
 `black-forest-labs/FLUX.2-klein-4b-fp8`; it does not quantize BF16 weights at startup.
-Quantized transformers also retain native LayerNorm/RMSNorm kernels, and Inductor
-uses conservative precision and fusion settings. This preserves the calibrated
-model's eager arithmetic without relaxing output validation.
+Quantized transformers also retain native LayerNorm/RMSNorm kernels to limit
+numerical differences at quantization boundaries.
 
-With the pinned image dependencies, FP8 generation and editing were validated on
-an RTX 6000 Ada with both Inductor AoT and JIT. Torch-TensorRT AoT and JIT still
-fail for this workload. NVFP4 checkpoint loading and full-model strict export
-were validated; native NVFP4 execution and image quality require a Blackwell run.
+Earlier FP8 generation and editing checks used explicit Inductor compiler
+settings; those results do not establish correctness with the defaults.
+NVFP4 checkpoint loading and full-model strict export were validated; native
+NVFP4 execution and image quality require a Blackwell run.
 
-AI Tune compares TorchInductor and Torch-TensorRT in AoT and just-in-time (JIT)
-modes. It selects the fastest successful compiled candidate, even if eager
-execution is faster. If all candidates fail, it logs an `ERROR` with the candidate
+AI Tune uses its default backend candidates and compiler settings. The example
+does not specify a backend list or compiler overrides. It selects the fastest
+successful candidate, even if eager execution is faster. If all candidates fail,
+it logs an `ERROR` with the candidate
 results and log paths, then falls back to eager execution at the selected precision.
 The selected backend must pass output validation before the model is registered.
 Validation compares generation, editing, and a held-out prompt against eager

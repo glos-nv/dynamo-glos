@@ -458,7 +458,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-aitune",
         action="store_true",
-        help="Tune the loaded transformer with AoT and JIT backends before serving (any precision).",
+        help="Tune the loaded transformer with AI Tune's default backends before serving (any precision).",
     )
     parser.add_argument(
         "--torch-compile",
