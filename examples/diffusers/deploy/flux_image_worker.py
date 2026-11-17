@@ -71,6 +71,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "black-forest-labs/FLUX.2-klein-4B"
 NVFP4_REPO = "black-forest-labs/FLUX.2-klein-4b-nvfp4"
 NVFP4_FILE = "flux-2-klein-4b-nvfp4.safetensors"
+FP8_REPO = "black-forest-labs/FLUX.2-klein-4b-fp8"
+FP8_FILE = "flux-2-klein-4b-fp8.safetensors"
 DEFAULT_SIZE = "1024x1024"
 DEFAULT_NUM_INFERENCE_STEPS = 4
 DEFAULT_GUIDANCE_SCALE = 1.0
@@ -131,15 +133,22 @@ class FluxImageBackend:
         from diffusers import Flux2KleinPipeline
 
         check_precision_support(self.args.precision)
-        if self.args.precision in ("fp4", "nvfp4"):
-            # NVFP4 transformer (Blackwell FP4 tensor cores); the text encoder
-            # and VAE stay BF16 and come from the base model.
+        if self.args.precision in ("fp8", "fp4", "nvfp4"):
+            # Load calibrated quantized weights; text encoder and VAE stay BF16.
             from huggingface_hub import hf_hub_download
-            from nvfp4_loader import build_nvfp4_transformer
 
-            logger.info("Loading NVFP4 transformer from %s", NVFP4_REPO)
-            checkpoint = hf_hub_download(NVFP4_REPO, NVFP4_FILE)
-            transformer = build_nvfp4_transformer(checkpoint, self.args.model)
+            if self.args.precision == "fp8":
+                from fp8_loader import build_fp8_transformer
+
+                logger.info("Loading FP8 transformer from %s", FP8_REPO)
+                checkpoint = hf_hub_download(FP8_REPO, FP8_FILE)
+                transformer = build_fp8_transformer(checkpoint, self.args.model)
+            else:
+                from nvfp4_loader import build_nvfp4_transformer
+
+                logger.info("Loading NVFP4 transformer from %s", NVFP4_REPO)
+                checkpoint = hf_hub_download(NVFP4_REPO, NVFP4_FILE)
+                transformer = build_nvfp4_transformer(checkpoint, self.args.model)
             pipe = Flux2KleinPipeline.from_pretrained(
                 self.args.model, transformer=transformer, torch_dtype=torch.bfloat16
             )

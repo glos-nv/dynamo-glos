@@ -27,7 +27,9 @@ from aitune.torch.backend import (
     BuildMode,
     TorchEagerBackend,
     TorchInductorAotBackend,
+    TorchInductorAotBackendConfig,
     TorchInductorJitBackend,
+    TorchInductorJitBackendConfig,
     TorchTensorRTAotBackend,
     TorchTensorRTAotBackendConfig,
     TorchTensorRTConfig,
@@ -122,12 +124,36 @@ def tune_transformer(
         # FLUX computes rotary frequencies in FP64; TRT needs FP32.
         truncate_double=True,
     )
+    # Quantization amplifies small changes in BF16 intermediates. Preserve eager
+    # rounding and kernel boundaries instead of relaxing output validation.
+    quantized = any(
+        p.dtype == torch.float8_e4m3fn for p in pipe.transformer.parameters()
+    )
+    inductor_options = (
+        {
+            "emulate_precision_casts": True,
+            "eager_numerics.division_rounding": True,
+            "eager_numerics.disable_ftz": True,
+            "max_fusion_size": 1,
+            "epilogue_fusion": False,
+            "prologue_fusion": False,
+        }
+        if quantized
+        else None
+    )
     candidates = [
-        TorchInductorAotBackend(),
+        TorchInductorAotBackend(
+            # AOT packaging mutates this dictionary; do not share it with JIT.
+            TorchInductorAotBackendConfig(
+                inductor_configs=dict(inductor_options) if inductor_options else None
+            )
+        ),
         TorchTensorRTAotBackend(
             TorchTensorRTAotBackendConfig(compile_config=trt_config)
         ),
-        TorchInductorJitBackend(),
+        TorchInductorJitBackend(
+            TorchInductorJitBackendConfig(options=inductor_options)
+        ),
         TorchTensorRTJitBackend(
             TorchTensorRTJitBackendConfig(compile_config=trt_config, fullgraph=True)
         ),

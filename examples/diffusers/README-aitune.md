@@ -106,13 +106,29 @@ Choose the transformer precision with `--precision`:
 | --- | --- | --- |
 | `bf16` (default) | BF16 weights and computation | BF16-capable CUDA GPU |
 | `fp16` | FP16 weights and computation, with BF16 pipeline inputs/outputs converted at the transformer boundary | BF16-capable CUDA GPU for the text encoder and VAE |
-| `fp8` | TorchAO dynamic FP8 E4M3 weights and activations for large linear layers; embeddings, output projections, and smaller layers remain BF16 | Ada or newer (compute capability 8.9+) |
+| `fp8` | Pretrained BFL FP8 E4M3 transformer weights with saved weight and activation scales; unquantized layers remain BF16 | Ada or newer (compute capability 8.9+) |
 | `fp4` or `nvfp4` | The same pretrained NVIDIA NVFP4 transformer checkpoint | Blackwell (compute capability 10.0+) |
 
 For example, use `--precision fp8 --use-aitune` to tune the FP8 transformer.
 The text encoder and VAE remain BF16 for every choice. Precision is applied before
 tuning, and eager fallback keeps that precision. Tuning does not automatically
 choose among precisions.
+
+FP8 and NVFP4 linear layers keep packed weights and scales as ordinary tensors.
+A custom PyTorch operator invokes TorchAO's native quantization and matrix
+multiplication, keeping its Python tensor wrappers outside compiler tracing.
+This permits Inductor export without converting the weights back to BF16, but
+prevents compiler fusion across those linear operations. Both precisions use
+the calibration scales saved in their checkpoints. `fp8` downloads
+`black-forest-labs/FLUX.2-klein-4b-fp8`; it does not quantize BF16 weights at startup.
+Quantized transformers also retain native LayerNorm/RMSNorm kernels, and Inductor
+uses conservative precision and fusion settings. This preserves the calibrated
+model's eager arithmetic without relaxing output validation.
+
+With the pinned image dependencies, FP8 generation and editing were validated on
+an RTX 6000 Ada with both Inductor AoT and JIT. Torch-TensorRT AoT and JIT still
+fail for this workload. NVFP4 checkpoint loading and full-model strict export
+were validated; native NVFP4 execution and image quality require a Blackwell run.
 
 AI Tune compares TorchInductor and Torch-TensorRT in AoT and just-in-time (JIT)
 modes. It selects the fastest successful compiled candidate, even if eager

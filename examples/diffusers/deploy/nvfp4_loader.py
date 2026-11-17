@@ -33,6 +33,7 @@ The reassembled weights become torchao NVFP4Tensors, which dispatch F.linear to
 the Blackwell FP4 tensor-core path (torch._scaled_mm) with correctly swizzled
 scales.
 """
+
 import json
 
 import torch
@@ -58,6 +59,19 @@ def load_nvfp4_state(ckpt_path, verbose=True):
         meta = f.metadata() or {}
     qmeta = json.loads(meta.get("_quantization_metadata", '{"layers":{}}'))["layers"]
     qlayers = {k for k, v in qmeta.items() if v.get("format") == "nvfp4"}
+    if not qlayers or len(qlayers) != len(qmeta):
+        raise ValueError(
+            "Klein checkpoint must declare nonempty, exclusively NVFP4 quantization metadata"
+        )
+    for suffix in ("weight_scale", "weight_scale_2", "input_scale"):
+        sources = {
+            key.removesuffix(f".{suffix}") for key in raw if key.endswith(f".{suffix}")
+        }
+        if sources != qlayers:
+            raise ValueError(
+                f"NVFP4 metadata/{suffix} mismatch: missing={sorted(qlayers - sources)}, "
+                f"unexpected={sorted(sources - qlayers)}"
+            )
     if verbose:
         print(
             f"[nvfp4] {len(qlayers)} quantized layers declared in checkpoint metadata"
@@ -79,11 +93,14 @@ def load_nvfp4_state(ckpt_path, verbose=True):
     b = conv(dict(view_b))
     c2 = conv(dict(view_c_w2))
     ci = conv(dict(view_c_in))
+    if not b or b.keys() != c2.keys() or b.keys() != ci.keys():
+        raise ValueError(
+            "Converted NVFP4 block, weight and activation scale targets do not match"
+        )
 
     if verbose:
         print(
-            f"[nvfp4] converted: base={len(a)} wscale={len(b)} "
-            f"wscale2={len(c2)} inscale={len(ci)}"
+            f"[nvfp4] converted: base={len(a)} wscale={len(b)} wscale2={len(c2)} inscale={len(ci)}"
         )
 
     quant = {}
@@ -94,13 +111,68 @@ def load_nvfp4_state(ckpt_path, verbose=True):
             raise KeyError(f"no packed weight for quantized module {mod}")
         if qdata.dtype != torch.uint8:
             raise TypeError(f"{mod}: expected uint8 packed fp4, got {qdata.dtype}")
-        quant[mod] = dict(
-            qdata=qdata,
-            scale=scale,
-            weight_scale_2=c2[wk].reshape(-1)[0].clone(),
-            input_scale=ci[wk].reshape(-1)[0].clone(),
-        )
+        if scale.dtype != torch.float8_e4m3fn or scale.shape != (
+            qdata.shape[0],
+            qdata.shape[1] // 8,
+        ):
+            raise ValueError(
+                f"{mod}: expected E4M3 scales for packed NVFP4 blocks of 16"
+            )
+        quant[mod] = {
+            "qdata": qdata,
+            "scale": scale,
+            "weight_scale_2": c2[wk].reshape(-1)[0].clone(),
+            "input_scale": ci[wk].reshape(-1)[0].clone(),
+        }
     return a, quant
+
+
+def _restore_nvfp4_weight(qdata, scale, per_tensor_scale, act_per_tensor_scale):
+    """Wrap saved tensors with the calibrated Klein NVFP4 execution policy."""
+    from torchao.prototype.mx_formats.nvfp4_tensor import (
+        NVFP4Tensor,
+        QuantizeTensorToNVFP4Kwargs,
+    )
+
+    return NVFP4Tensor(
+        qdata,
+        scale,
+        BLOCK,
+        torch.bfloat16,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=act_per_tensor_scale,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+        act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(
+            block_size=BLOCK,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+            use_dynamic_per_tensor_scale=False,
+        ),
+    )
+
+
+# Dynamo sees plain tensors and an opaque operator, so strict export never
+# traces the TorchAO constructor or its activation configuration object. Native
+# quantization and GEMM stay in TorchAO, at the cost of fusion across this call.
+# Import this module before loading a PT2 package to register its runtime kernel.
+@torch.library.custom_op(
+    "dynamo_flux::nvfp4_linear", mutates_args=(), device_types="cuda"
+)
+def _nvfp4_linear(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    act_per_tensor_scale: torch.Tensor,
+) -> torch.Tensor:
+    weight = _restore_nvfp4_weight(qdata, scale, per_tensor_scale, act_per_tensor_scale)
+    return torch.nn.functional.linear(x, weight)
+
+
+@_nvfp4_linear.register_fake
+def _nvfp4_linear_fake(x, qdata, scale, per_tensor_scale, act_per_tensor_scale):
+    return x.new_empty((x.shape[0], qdata.shape[0]))
 
 
 class NVFP4Linear(torch.nn.Module):
@@ -114,17 +186,53 @@ class NVFP4Linear(torch.nn.Module):
 
     def __init__(self, weight, in_features, out_features):
         super().__init__()
-        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        if weight.per_tensor_scale is None or weight.act_per_tensor_scale is None:
+            raise ValueError(
+                "NVFP4Linear requires the saved weight and activation global scales"
+            )
+        # Export may retain references while AITune offloads the source module.
+        # Store plain parameters so offload never swaps a tensor subclass.
+        self.qdata = torch.nn.Parameter(weight.qdata, requires_grad=False)
+        self.scale = torch.nn.Parameter(weight.scale, requires_grad=False)
+        self.per_tensor_scale = torch.nn.Parameter(
+            weight.per_tensor_scale, requires_grad=False
+        )
+        self.act_per_tensor_scale = torch.nn.Parameter(
+            weight.act_per_tensor_scale, requires_grad=False
+        )
+        restored_weight = self.weight
+        if (
+            type(weight) is not type(restored_weight)
+            or weight.dtype != torch.bfloat16
+            or weight.__tensor_flatten__() != restored_weight.__tensor_flatten__()
+            or weight.shape != (out_features, in_features)
+        ):
+            raise ValueError(
+                "NVFP4Linear requires the calibrated Klein NVFP4 tensor configuration"
+            )
         self.in_features = in_features
         self.out_features = out_features
 
     def forward(self, x):
         shp = x.shape
-        y = torch.nn.functional.linear(x.reshape(-1, shp[-1]), self.weight)
+        y = _nvfp4_linear(
+            x.reshape(-1, shp[-1]),
+            self.qdata,
+            self.scale,
+            self.per_tensor_scale,
+            self.act_per_tensor_scale,
+        )
         return y.view(*shp[:-1], self.out_features)
 
     def extra_repr(self):
         return f"in_features={self.in_features}, out_features={self.out_features}, nvfp4=True"
+
+    @property
+    def weight(self):
+        """Reconstruct the native weight for inspection, outside compiled forward."""
+        return _restore_nvfp4_weight(
+            self.qdata, self.scale, self.per_tensor_scale, self.act_per_tensor_scale
+        )
 
 
 def _set_module(root, path, new):
@@ -138,18 +246,21 @@ def _set_module(root, path, new):
 def build_nvfp4_transformer(
     ckpt_path, config_repo, subfolder="transformer", device="cuda", verbose=True
 ):
+    """Load packed NVFP4 weights without allocating dense transformer weights.
+
+    TorchAO 0.16 uses ``is_swizzled_scales``. Plain tensor parameters and the
+    custom operator keep its tensor subclass outside export and CPU offload.
+    Native execution requires Blackwell; loading/export alone do not prove it.
+    """
     from diffusers import Flux2Transformer2DModel
-    from torchao.prototype.mx_formats.nvfp4_tensor import (
-        NVFP4Tensor,
-        QuantizeTensorToNVFP4Kwargs,
-    )
 
     base_sd, quant = load_nvfp4_state(ckpt_path, verbose=verbose)
 
-    cfg = Flux2Transformer2DModel.load_config(config_repo, subfolder=subfolder)
+    config = Flux2Transformer2DModel.load_config(config_repo, subfolder=subfolder)
     with torch.device("meta"):
-        model = Flux2Transformer2DModel.from_config(cfg)
-    model = model.to_empty(device=device)
+        model = Flux2Transformer2DModel.from_config(config)
+    # Set dense placeholder dtype before installing quantized layers. Assign the
+    # checkpoint directly; never allocate a dense copy of the packed transformer.
     model = model.to(torch.bfloat16)
 
     missing, unexpected = model.load_state_dict(base_sd, strict=False, assign=True)
@@ -166,7 +277,9 @@ def build_nvfp4_transformer(
         if m is None:
             raise KeyError(f"module {path} not found in diffusers model")
         out_f, in_f_packed = parts["qdata"].shape
-        if getattr(m, "bias", None) is not None:
+        if not isinstance(m, torch.nn.Linear):
+            raise TypeError(f"{path}: expected a linear layer")
+        if m.bias is not None:
             raise RuntimeError(f"{path} unexpectedly has a bias")
         if m.in_features != in_f_packed * 2:
             raise ValueError(
@@ -174,33 +287,20 @@ def build_nvfp4_transformer(
             )
         if m.out_features != out_f:
             raise ValueError(f"{path}: out_features {m.out_features} != {out_f}")
+        # ModelOpt packs the two FP4 values in each byte in the opposite order
+        # from torchao's unpack, and stores the e4m3 block scales already in the
+        # swizzled (128x4 tiled) layout. Preserve both checkpoint conventions.
+        q = parts["qdata"].to(device)
+        q = ((q & 0x0F) << 4) | ((q >> 4) & 0x0F)
         # The activation global scale is carried on the tensor itself
         # (act_per_tensor_scale); the kwargs object only holds layout flags.
         # ModelOpt's `input_scale` is amax/(FP4_MAX*E4M3_MAX), the same
         # convention torchao's per_tensor_amax_to_scale produces.
-        act_kw = QuantizeTensorToNVFP4Kwargs(
-            block_size=BLOCK,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=False,
-        )
-        # ModelOpt packs the two FP4 values in each byte in the opposite order
-        # from torchao's unpack, and stores the e4m3 block scales already in the
-        # swizzled (128x4 tiled) layout. Verified against the BF16 checkpoint:
-        # this combination gives cos=0.9955 / rel_err=0.095 (the inherent FP4
-        # quantization error); leaving either wrong gives cos=0.0.
-        q = parts["qdata"].to(device)
-        q = ((q & 0x0F) << 4) | ((q >> 4) & 0x0F)
-        t = NVFP4Tensor(
+        t = _restore_nvfp4_weight(
             q.contiguous(),
             parts["scale"].to(device).contiguous(),
-            BLOCK,
-            torch.bfloat16,
-            per_tensor_scale=parts["weight_scale_2"].to(device),
-            act_per_tensor_scale=parts["input_scale"].to(device),
-            _is_swizzled_scales=True,
-            use_triton_kernel=False,
-            act_quant_kwargs=act_kw,
+            parts["weight_scale_2"].to(device),
+            parts["input_scale"].to(device),
         )
         _set_module(model, path, NVFP4Linear(t, m.in_features, m.out_features))
         installed += 1

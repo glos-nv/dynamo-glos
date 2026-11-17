@@ -23,6 +23,58 @@ logger = logging.getLogger(__name__)
 PRECISIONS = ("bf16", "fp16", "fp8", "fp4", "nvfp4")
 
 
+@torch.library.custom_op(
+    "dynamo_flux::layer_norm", mutates_args=(), device_types="cuda"
+)
+def _layer_norm(
+    x: torch.Tensor,
+    shape: list[int],
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    return torch.nn.functional.layer_norm(x, shape, weight, bias, eps)
+
+
+@_layer_norm.register_fake
+def _layer_norm_fake(x, shape, weight, bias, eps):
+    return x.new_empty(x.shape)
+
+
+@torch.library.custom_op("dynamo_flux::rms_norm", mutates_args=(), device_types="cuda")
+def _rms_norm(
+    x: torch.Tensor, shape: list[int], weight: torch.Tensor | None, eps: float | None
+) -> torch.Tensor:
+    return torch.nn.functional.rms_norm(x, shape, weight, eps)
+
+
+@_rms_norm.register_fake
+def _rms_norm_fake(x, shape, weight, eps):
+    return x.new_empty(x.shape)
+
+
+class _NativeNorm(torch.nn.Module):
+    """Keep native normalization arithmetic at the quantization boundary.
+
+    Compiler reduction/decomposition differences can change FP8/FP4 rounding
+    decisions. Preserve the original CUDA normalization, including its weights,
+    while allowing compilation of the surrounding transformer graph.
+    """
+
+    def __init__(self, norm):
+        super().__init__()
+        self.weight = norm.weight
+        self.is_rms = isinstance(norm, torch.nn.RMSNorm)
+        self.bias = None if self.is_rms else norm.bias
+        self.shape = list(norm.normalized_shape)
+        self.eps = norm.eps
+
+    def forward(self, x):
+        if self.is_rms:
+            return _rms_norm(x, self.shape, self.weight, self.eps)
+        return _layer_norm(x, self.shape, self.weight, self.bias, self.eps)
+
+
 def check_precision_support(precision: str) -> None:
     """Check FP8/NVFP4 support on the current CUDA device before loading weights.
 
@@ -60,28 +112,17 @@ def _bf16_output(_module, _args, output):
     return _cast_floating(output, torch.bfloat16)
 
 
-def _fp8_linear(module, name: str) -> bool:
-    """Select large FLUX linear layers, keeping embeddings and output in BF16."""
-    return (
-        isinstance(module, torch.nn.Linear)
-        and "embed" not in name
-        and name not in ("norm_out.linear", "proj_out")
-        and module.in_features >= 1024
-        and module.out_features >= 1024
-    )
-
-
 def prepare_transformer(transformer, precision: str) -> None:
     """Configure the loaded FLUX transformer in place before tuning or serving.
 
     FP16 converts weights and installs hooks to keep the BF16 pipeline boundary.
-    FP8 quantizes eligible linear layers with TorchAO, leaving the remaining
-    layers in BF16. BF16 and NVFP4 need no conversion here: the worker loads
-    their weights directly. The text encoder and VAE are not modified.
+    The worker loads BF16, FP8 and NVFP4 weights directly. Quantized transformers
+    retain native normalization kernels to preserve their calibration inputs
+    when compiled. The text encoder and VAE are not modified.
 
     Call once after moving the pipeline to CUDA and checking hardware support.
     Precision is independent of backend selection, so eager fallback preserves
-    these changes. Raise ``ValueError`` if FP8 has no eligible linear layers.
+    these changes.
     """
     if precision == "fp16":
         transformer.to(dtype=torch.float16)
@@ -89,27 +130,8 @@ def prepare_transformer(transformer, precision: str) -> None:
         # hooks also surround the tuned backend and the eager fallback.
         transformer.register_forward_pre_hook(_fp16_inputs, with_kwargs=True)
         transformer.register_forward_hook(_bf16_output)
-    elif precision == "fp8":
-        # TorchAO is optional for BF16/FP16 serving without AI Tune.
-        from torchao.quantization import (
-            Float8DynamicActivationFloat8WeightConfig,
-            quantize_,
-        )
-        from torchao.quantization.granularity import PerTensor
-        from torchao.utils import unwrap_tensor_subclass
-
-        count = sum(
-            _fp8_linear(module, name) for name, module in transformer.named_modules()
-        )
-        if not count:
-            raise ValueError("No transformer linear layers are eligible for FP8")
-        quantize_(
-            transformer,
-            Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor()),
-            filter_fn=_fp8_linear,
-        )
-        # Store quantized weights as plain tensor components for AoT export and
-        # CPU offload. The parametrization reconstructs FP8 weights for execution.
-        unwrap_tensor_subclass(transformer)
-        logger.info("Quantized %d transformer linear layers to FP8 E4M3", count)
+    elif precision in ("fp8", "fp4", "nvfp4"):
+        for name, module in list(transformer.named_modules()):
+            if isinstance(module, (torch.nn.LayerNorm, torch.nn.RMSNorm)):
+                transformer.set_submodule(name, _NativeNorm(module))
     logger.info("Transformer precision: %s", precision)
