@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Check FLUX precisions against the installed AI Tune default candidates.
+"""Check and benchmark FLUX precisions with AI Tune's default candidates.
 
 Run inside Dockerfile.aitune's image. Each combination gets a fresh process and
 AI Tune cache. The worker's actual loading and startup validation code is reused;
@@ -29,11 +29,13 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-STAGES = ("load", "compile", "generation", "editing", "validation")
+STAGES = ("load", "compile", "generation", "editing", "validation", "benchmark")
+logger = logging.getLogger(__name__)
 
 
 def _write_json(path, value):
@@ -162,9 +164,22 @@ def _run_case(path):
                 row[label] = "PASS"
             phase = "validation"
             save()
-            real_validate(actual, expected)
+            try:
+                real_validate(actual, expected)
+            except RuntimeError as error:
+                # Image agreement and execution speed are independent results.
+                # Keep the compiled candidate for diagnostic benchmarking.
+                row["validation"] = "FAIL"
+                row.setdefault("validation_errors", []).append(
+                    {"case": label, "error": str(error)}
+                )
+                logger.warning(
+                    "%s image validation failed: %s; continuing diagnostic checks and benchmark",
+                    label,
+                    error,
+                )
             checked += 1
-            if checked == 3:
+            if checked == 3 and row["validation"] != "FAIL":
                 row["validation"] = "PASS"
             phase = "editing" if checked == 1 else "validation"
             save()
@@ -203,7 +218,18 @@ def _run_case(path):
                     result.save(directory / f"{phase}.png")
                     row[phase] = "PASS"
                     reference = result
-            row["status"] = "PASS"
+            if row["benchmark_options"]["requests"]:
+                from flux_benchmark import benchmark_dynamo
+
+                phase = "benchmark"
+                save()
+                row["benchmark_metrics"] = benchmark_dynamo(
+                    backend, directory, row["benchmark_options"]
+                )
+                row["benchmark"] = "PASS"
+            else:
+                row["benchmark"] = "DISABLED"
+            row["status"] = "FAIL" if row["validation"] == "FAIL" else "PASS"
         finally:
             backend._executor.shutdown(wait=True)
     except Exception as error:  # noqa: BLE001 - record failures from optional compilers
@@ -243,28 +269,8 @@ def _subprocess(arguments, log, timeout, env=None):
             raise
 
 
-def _report(directory, metadata, rows):
-    columns = (
-        "Precision",
-        "Backend",
-        "Compile",
-        "Generation",
-        "Editing",
-        "Validation",
-        "Result",
-    )
-    cells = [columns] + [
-        (
-            row["precision"],
-            row["backend"]["name"],
-            row["compile"],
-            row["generation"],
-            row["editing"],
-            row["validation"],
-            row["status"],
-        )
-        for row in rows
-    ]
+def _table(columns, records):
+    cells = [columns, *records]
     widths = [max(len(cell[index]) for cell in cells) for index in range(len(columns))]
 
     def line(cell):
@@ -274,18 +280,99 @@ def _report(directory, metadata, rows):
             + " |"
         )
 
-    table = "\n".join(
+    return "\n".join(
         [
             line(columns),
             line(tuple("-" * width for width in widths)),
-            *(line(cell) for cell in cells[1:]),
+            *(line(cell) for cell in records),
         ]
     )
+
+
+def _metric_tables(rows):
+    tables = []
+    for title, metric in (
+        ("HTTP latency (ms)", "latency_s"),
+        ("Worker generation time (ms)", "generation_s"),
+        ("Throughput (images/s, concurrency 1)", "throughput_images_s"),
+    ):
+        throughput = metric == "throughput_images_s"
+        headings = (
+            ("Images/s", "Images", "Elapsed (s)")
+            if throughput
+            else ("Mean", "P50", "P95")
+        )
+        records = []
+        for row in rows:
+            values = ("--", "--", "--")
+            if row["benchmark"] == "PASS":
+                result = row["benchmark_metrics"]
+                values = (
+                    (
+                        f"{result[metric]:.3f}",
+                        str(result["completed_requests"]),
+                        f"{result['elapsed_s']:.3f}",
+                    )
+                    if throughput
+                    else tuple(
+                        f"{result[metric][stat] * 1000:.2f}"
+                        for stat in ("mean", "p50", "p95")
+                    )
+                )
+            records.append(
+                (
+                    row["precision"],
+                    row["backend"]["name"],
+                    *values,
+                    row["validation"],
+                    row["benchmark"],
+                )
+            )
+        tables.append(
+            f"### {title}\n\n"
+            + _table(
+                ("Precision", "Backend", *headings, "Validation", "Benchmark"), records
+            )
+        )
+    return "\n\n".join(tables)
+
+
+def _report(directory, metadata, rows):
+    columns = (
+        "Precision",
+        "Backend",
+        "Compile",
+        "Generation",
+        "Editing",
+        "Validation",
+        "Benchmark",
+        "Result",
+    )
+    records = [
+        (
+            row["precision"],
+            row["backend"]["name"],
+            row["compile"],
+            row["generation"],
+            row["editing"],
+            row["validation"],
+            row["benchmark"],
+            row["status"],
+        )
+        for row in rows
+    ]
+    table = _table(columns, records)
+    metrics = _metric_tables(rows)
     details = "\n".join(
         f"- {row['precision']} / {row['backend']['name']}: {row['error']}"
         + (f" (log: {row['directory']}/run.log)" if row["status"] != "SKIP" else "")
         for row in rows
         if row.get("error")
+    )
+    validation_details = "\n".join(
+        f"- {row['precision']} / {row['backend']['name']} / {failure['case']}: {failure['error']}"
+        for row in rows
+        for failure in row.get("validation_errors", [])
     )
     report = (
         f"GPU: {metadata['gpu']}\n\n"
@@ -294,11 +381,19 @@ def _report(directory, metadata, rows):
         "Compile includes AI Tune build, checks, and profiling. Eager fallback "
         "does not count as success. Validation compares images with eager at "
         "the same precision; it is not a comparison with BF16.\n\n"
-        f"{details}\n"
+        f"{metrics}\n\n"
+        "Benchmarks use serial text-to-image HTTP requests. Startup and warmups "
+        "are excluded. Generation time excludes PNG encoding and transport; "
+        "latency includes the full response transfer. Throughput includes client "
+        "work between requests and is not a maximum-concurrency measurement.\n\n"
+        "Image validation failures do not block diagnostic benchmarks; consult "
+        "the Validation column before interpreting performance results.\n\n"
+        f"{details}\n{validation_details}\n"
     )
     (directory / "results.md").write_text(report)
     _write_json(directory / "results.json", {"environment": metadata, "results": rows})
     print(table, flush=True)
+    print("\n" + metrics, flush=True)
 
 
 def main():
@@ -317,6 +412,24 @@ def main():
     parser.add_argument("--list-backends", action="store_true")
     parser.add_argument("--size", default="1024x1024")
     parser.add_argument("--steps", type=int, choices=range(1, 51), default=4)
+    parser.add_argument(
+        "--benchmark-requests",
+        type=int,
+        default=10,
+        help="Measured HTTP requests per passing configuration; 0 disables benchmarking",
+    )
+    parser.add_argument(
+        "--benchmark-warmup",
+        type=int,
+        default=2,
+        help="Unmeasured HTTP warmup requests",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=120,
+        help="Timeout in seconds for each benchmark HTTP request",
+    )
     parser.add_argument(
         "--timeout", type=int, default=1800, help="Seconds per combination"
     )
@@ -342,6 +455,10 @@ def main():
         )
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.benchmark_requests < 0 or args.benchmark_warmup < 0:
+        parser.error("Benchmark request and warmup counts must be nonnegative")
+    if args.request_timeout <= 0:
+        parser.error("--request-timeout must be positive")
     directory = args.output_dir.resolve() / datetime.now(UTC).strftime(
         "%Y%m%dT%H%M%S.%fZ"
     )
@@ -382,6 +499,13 @@ def main():
                 backend=backend,
                 size=args.size,
                 steps=args.steps,
+                benchmark_options={
+                    "size": args.size,
+                    "steps": args.steps,
+                    "requests": args.benchmark_requests,
+                    "warmup": args.benchmark_warmup,
+                    "request_timeout": args.request_timeout,
+                },
                 directory=case_dir.name,
                 status="PENDING",
                 phase="load",
@@ -411,6 +535,11 @@ def main():
                             **os.environ,
                             "AITUNE_CACHE_DIR": str(case_dir / "aitune"),
                             "PYTHONUNBUFFERED": "1",
+                            "DYN_DISCOVERY_BACKEND": "file",
+                            "DYN_EVENT_PLANE": "zmq",
+                            "DYN_FILE_KV": str(case_dir / "discovery"),
+                            "DYN_NAMESPACE": "flux-bench-" + uuid.uuid4().hex,
+                            "DYN_SYSTEM_PORT": "-1",
                         },
                     )
                     if code:

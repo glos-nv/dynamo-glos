@@ -77,7 +77,7 @@ transformer backend, including eager fallback if compilation fails.
 Ahead-of-time (AoT) input-shape bounds follow the
 worker's `--max-image-side` setting and include both generation and editing.
 
-### Check precisions and backends
+### Check and benchmark precisions and backends
 
 After building the image, open a container with an output directory mounted from
 the host. Run this on an idle GPU; each combination loads the full model and
@@ -107,7 +107,11 @@ The table is printed after each combination and saved as `results.md` in a new
 timestamped directory under `precision-results` on the host. `results.json`
 also records the GPU, package versions, candidate configurations, timings, and
 errors. Each combination has its own `run.log`, AI Tune artifacts, and output PNGs.
-No frontend or HTTP service is started.
+After a configuration completes its image checks, the script serves that loaded model
+through a temporary Dynamo worker endpoint and frontend, then benchmarks
+`/v1/images/generations`. The frontend binds to a dynamically chosen localhost
+port; no additional Docker port mapping is needed. Each case uses isolated file
+discovery, and its services stop before the next case starts.
 
 The columns have distinct meanings:
 
@@ -119,11 +123,42 @@ The columns have distinct meanings:
 - **Validation**: `PASS` means the worker's generation, editing, and held-out
   images passed the same-seed, same-precision eager comparison described below.
   Eager's own row shows `N/A` and checks image dimensions and nonuniform pixels.
+  Image mismatches are logged as `FAIL` but do not prevent diagnostic benchmarking.
+  The normal serving worker still rejects these mismatches during startup.
+- **Benchmark**: `PASS` means all warmup and measured HTTP requests succeeded
+  and returned decodable images of the requested size. Compilation failures,
+  eager fallback, and inference errors prevent benchmarking that candidate.
 - **Result**: the overall outcome, including loading failures. `NOT RUN` in a
   stage means an earlier failure prevented that check. See the row's log for
-  the underlying error.
+  the underlying error. An image mismatch keeps the overall result `FAIL` even
+  when benchmarking succeeds.
 
-The timeout defaults to 1,800 seconds per combination, including model loading.
+Three additional tables report performance for each benchmarked precision/backend:
+
+| Table | Measurement |
+| --- | --- |
+| HTTP latency | Mean, P50, and P95 milliseconds from sending a request to receiving its complete HTTP response, including image encoding and transfer |
+| Throughput | Successful images per second, from the first measured request to the last complete response, including client work between requests |
+| Worker generation time | Mean, P50, and P95 milliseconds for the pipeline call, including text encoding, denoising, and VAE decoding; CUDA is synchronized, and PNG encoding and transport are excluded |
+
+By default, each case uses two unmeasured warmups and ten measured text-to-image
+requests, cycling through the same three prompts with deterministic seeds.
+Requests are serial, with one image per request, because this worker rejects
+concurrent requests. These numbers describe concurrency-one performance, not
+maximum saturated throughput. Model loading, compilation, service startup, and
+warmup are excluded from all three metrics. Percentiles use the nearest-rank
+method; increase the request count for more representative tail latency.
+
+The tables appear both in the console and in `results.md`. Each case additionally
+saves `frontend.log`, `benchmark.json` with the summary, and `requests.jsonl` with
+individual timings, prompts, seeds, and warmup flags. A failed HTTP request
+invalidates that case's benchmark; partial samples remain in `requests.jsonl`.
+Each metric table includes the image-validation status, so results from a model
+that produces different images remain identifiable. Failed or skipped benchmarks
+have no performance numbers. Eager results are labeled as the untuned baseline.
+
+The timeout defaults to 1,800 seconds per combination, including model loading,
+tuning, and benchmarking. Each HTTP request has a 120-second timeout.
 A failure or timeout does not stop subsequent combinations. Exit status is `1`
 if any combination failed, `2` for setup errors, and `130` for an interrupted run;
 completed and skipped results remain saved. Each combination uses a fresh AI Tune
@@ -135,6 +170,7 @@ To limit a run or identify individual default candidates:
 python deploy/check_precision_backends.py --list-backends --output-dir /results
 python deploy/check_precision_backends.py --precisions fp8 fp4 --output-dir /results
 python deploy/check_precision_backends.py --precisions bf16 --backends eager --output-dir /results
+python deploy/check_precision_backends.py --precisions bf16 --benchmark-requests 30 --benchmark-warmup 3 --output-dir /results
 ```
 
 `--backends` also accepts the numeric IDs printed by `--list-backends`. IDs
@@ -142,6 +178,8 @@ distinguish different configurations of the same backend class. Use `--timeout`
 to allow longer compilation, or `--size` and `--steps` to change the workload
 (defaults: `1024x1024`, four steps). Results apply to the tested workload and
 environment, not all image sizes or GPU architectures.
+Use `--request-timeout` for slower HTTP requests. To run only the original
+compilation and image checks, set `--benchmark-requests 0`.
 
 ### Details
 
