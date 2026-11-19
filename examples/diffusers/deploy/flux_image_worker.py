@@ -15,6 +15,8 @@
 # limitations under the License.
 """FLUX.2-klein diffusers example worker for Dynamo's /v1/images endpoints.
 
+Loads a saved AI Tune artifact when --artifact-dir is supplied; otherwise uses
+torch.compile. Tuning is an offline command and never runs in this worker.
 Serves text-to-image and image-to-image (reference-image editing) from a single
 ``Flux2KleinPipeline``, with a BF16, FP16, FP8, or NVFP4 transformer.
 ``--precision fp4`` is an alias for ``nvfp4``. The text encoder and VAE stay BF16.
@@ -43,6 +45,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -102,6 +105,7 @@ class FluxImageBackend:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.execution_mode = "aitune" if args.artifact_dir else "torch.compile"
         self.model_name: str = args.served_model_name or args.model
         self.pipe: Any = None
         self.supports_edit = False
@@ -110,12 +114,35 @@ class FluxImageBackend:
         self._request_task: asyncio.Task[dict[str, Any]] | None = None
 
     async def initialize_model(self) -> None:
-        """Load, optionally tune, and warm up the pipeline before registration."""
+        """Load an artifact or torch.compile, then warm both modes before readiness."""
+        from torch._dynamo.utils import get_compilation_metrics
+
+        prior_metrics = {id(item) for item in get_compilation_metrics()}
+        started = time.perf_counter()
         loop = asyncio.get_running_loop()
         self.pipe = await loop.run_in_executor(self._executor, self._load)
+        loaded = time.perf_counter()
         if self.args.warmup > 0:
             await loop.run_in_executor(self._executor, self._warmup)
-        logger.info("Pipeline ready (%s)", self.model_name)
+        self.startup_timings = {
+            "model_load_seconds": loaded - started,
+            "warmup_seconds": time.perf_counter() - loaded,
+            # PyTorch 2.11 foreground frame timings, excluding runtime events.
+            "startup_compilation_seconds": sum(
+                item.entire_frame_compile_time_s or 0.0
+                for item in get_compilation_metrics()
+                if id(item) not in prior_metrics and not item.is_runtime
+            ),
+        }
+        logger.info(
+            "Pipeline ready (%s): mode=%s, load=%.3fs, warmup=%.3fs, total=%.3fs, compilation=%.3fs",
+            self.model_name,
+            self.execution_mode,
+            self.startup_timings["model_load_seconds"],
+            self.startup_timings["warmup_seconds"],
+            time.perf_counter() - started,
+            self.startup_timings["startup_compilation_seconds"],
+        )
 
     async def close(self) -> None:
         """Drain an in-flight request before shutting down the inference thread."""
@@ -128,8 +155,8 @@ class FluxImageBackend:
         if not task.cancelled():
             task.exception()
 
-    def _load(self) -> Any:
-        """Load the chosen precision and optionally select a validated backend."""
+    def _load_pipeline(self) -> Any:
+        """Load the original pipeline at the requested precision, without compiling."""
         from diffusers import Flux2KleinPipeline
 
         check_precision_support(self.args.precision)
@@ -161,21 +188,24 @@ class FluxImageBackend:
         pipe.set_progress_bar_config(disable=True)
         prepare_transformer(pipe.transformer, self.args.precision)
 
-        if self.args.use_aitune:
-            # Keep AI Tune optional for the original worker launch path.
-            from flux_aitune import tune_transformer
-
-            width, height = self._parse_size(self.args.default_size)
-            tune_transformer(
-                pipe,
-                width=width,
-                height=height,
-                steps=self.args.default_num_inference_steps,
-                guidance_scale=self.args.default_guidance_scale,
-                max_image_side=self.args.max_image_side,
-                size_multiple=SIZE_MULTIPLE,
+        self.supports_edit = "image" in inspect.signature(pipe.__call__).parameters
+        if not self.supports_edit:
+            raise RuntimeError(
+                "This FLUX pipeline does not support reference-image editing"
             )
-        elif self.args.torch_compile:
+        return pipe
+
+    def _load(self) -> Any:
+        """Load a saved tuned transformer or enable the default torch.compile path."""
+        if self.args.artifact_dir:
+            from flux_artifacts import load_artifact, read_manifest, validate_artifact
+
+            manifest = read_manifest(self.args.artifact_dir)
+            validate_artifact(self.args.artifact_dir, manifest)
+        pipe = self._load_pipeline()
+        if self.args.artifact_dir:
+            load_artifact(pipe, self.args.artifact_dir, manifest)
+        else:
             logger.info(
                 "torch.compile(transformer.forward, mode=%s)",
                 self.args.torch_compile_mode,
@@ -191,14 +221,6 @@ class FluxImageBackend:
                 torch._dynamo.config.cache_size_limit, 16
             )
 
-        # Fail at startup, not on the first edit request, if this diffusers
-        # build's pipeline does not accept a reference image.
-        self.supports_edit = "image" in inspect.signature(pipe.__call__).parameters
-        if not self.supports_edit:
-            logger.warning(
-                "%s.__call__ has no `image` parameter; serving text-to-image only",
-                type(pipe).__name__,
-            )
         return pipe
 
     def _warmup(self) -> None:
@@ -423,7 +445,7 @@ async def backend_worker(runtime: DistributedRuntime, args: argparse.Namespace) 
         await backend.close()
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FLUX.2-klein diffusers worker for Dynamo (t2i + i2i)"
     )
@@ -431,7 +453,7 @@ def _parse_args() -> argparse.Namespace:
         "--model",
         "--model-path",
         dest="model",
-        default=DEFAULT_MODEL,
+        default=None,
         help=f"HuggingFace model path (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
@@ -448,7 +470,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--precision",
         choices=PRECISIONS,
-        default="bf16",
+        default=None,
         help=(
             "Transformer precision. fp8 needs Ada or newer and torchao; "
             "fp4 is an alias for nvfp4 and needs Blackwell and torchao. "
@@ -456,15 +478,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--use-aitune",
-        action="store_true",
-        help="Tune the loaded transformer with AI Tune's default backends before serving (any precision).",
+        "--artifact-dir",
+        type=Path,
+        help="Load an existing AI Tune artifact. Missing or incompatible artifacts fail startup; no tuning is performed.",
     )
     parser.add_argument(
         "--torch-compile",
         action="store_true",
         dest="torch_compile",
-        help="torch.compile the transformer forward (slower start, faster steady state).",
+        help="Compatibility flag: torch.compile is already the default without --artifact-dir.",
     )
     parser.add_argument(
         "--torch-compile-mode",
@@ -475,24 +497,57 @@ def _parse_args() -> argparse.Namespace:
         "--warmup",
         type=int,
         default=1,
-        help="Warmup iterations per mode (t2i, i2i) at startup; 0 disables.",
+        help="Warmup iterations per mode (t2i, i2i) before readiness; at least 1.",
     )
-    parser.add_argument("--default-size", default=DEFAULT_SIZE)
-    parser.add_argument(
-        "--default-num-inference-steps", type=int, default=DEFAULT_NUM_INFERENCE_STEPS
-    )
+    parser.add_argument("--default-size", default=None)
+    parser.add_argument("--default-num-inference-steps", type=int, default=None)
     parser.add_argument(
         "--default-guidance-scale", type=float, default=DEFAULT_GUIDANCE_SCALE
     )
-    parser.add_argument("--max-image-side", type=int, default=DEFAULT_MAX_IMAGE_SIDE)
+    parser.add_argument("--max-image-side", type=int, default=None)
     parser.add_argument(
         "--max-num-inference-steps",
         type=int,
         default=DEFAULT_MAX_NUM_INFERENCE_STEPS,
     )
-    args = parser.parse_args()
-    if args.use_aitune and args.torch_compile:
-        parser.error("--use-aitune and --torch-compile are mutually exclusive")
+    args = parser.parse_args(argv)
+    defaults = {
+        "model": DEFAULT_MODEL,
+        "precision": "bf16",
+        "default_size": DEFAULT_SIZE,
+        "default_num_inference_steps": DEFAULT_NUM_INFERENCE_STEPS,
+        "max_image_side": DEFAULT_MAX_IMAGE_SIDE,
+    }
+    if args.artifact_dir:
+        from flux_artifacts import read_manifest
+
+        args.artifact_dir = args.artifact_dir.resolve()
+        if args.torch_compile:
+            parser.error("--artifact-dir and --torch-compile are mutually exclusive")
+        manifest = read_manifest(args.artifact_dir)
+        defaults.update(
+            model=manifest["model"],
+            precision=manifest["precision"],
+            default_size=manifest["workload"]["size"],
+            default_num_inference_steps=manifest["workload"]["steps"],
+            max_image_side=manifest["workload"]["max_image_side"],
+        )
+        for field in ("model", "precision"):
+            value = getattr(args, field)
+            if field == "precision" and value == "nvfp4":
+                value = "fp4"
+            if value is not None and value != defaults[field]:
+                parser.error(
+                    f"--{field} does not match the artifact ({defaults[field]})"
+                )
+        if (
+            args.max_image_side is not None
+            and args.max_image_side > defaults["max_image_side"]
+        ):
+            parser.error("--max-image-side exceeds the artifact's recorded bounds")
+    for field, value in defaults.items():
+        if getattr(args, field) is None:
+            setattr(args, field, value)
     for name in (
         "max_image_side",
         "max_num_inference_steps",
@@ -500,8 +555,10 @@ def _parse_args() -> argparse.Namespace:
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be > 0")
-    if args.warmup < 0:
-        parser.error("--warmup must be >= 0")
+    if args.warmup < 1:
+        parser.error(
+            "--warmup must be >= 1 so compilation/activation completes before readiness"
+        )
     if args.default_num_inference_steps > args.max_num_inference_steps:
         parser.error(
             "--default-num-inference-steps must not exceed --max-num-inference-steps"

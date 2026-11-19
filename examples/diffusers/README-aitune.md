@@ -3,18 +3,15 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-## Serve a tuned FLUX.2-klein
+## Tune, serve, and benchmark FLUX.2-klein
 
-Run text-to-image generation and reference-image editing with FLUX.2-klein,
-optimized at startup by AI Tune and served by NVIDIA Dynamo.
-Tuning selects an inference backend; it does not train or fine-tune model weights.
+AI Tune optimizes inference execution; it does not train model weights.
+Tuning runs offline. The server either loads a saved AI Tune artifact or uses
+`torch.compile` without AI Tune. It never tunes during startup.
 
-### Summary
+### Build
 
-#### Build
-
-Use Docker with NVIDIA GPU support and a GPU that supports the selected precision
-(see the table below). Build the example image from the repository root:
+From the repository root:
 
 ```bash
 docker build \
@@ -23,232 +20,206 @@ docker build \
   -t dynamo-glos-flux2-klein:latest examples/diffusers
 ```
 
-#### Tuning and starting the service
+The image independently builds Dynamo and installs AI Tune 0.6.0 from PyPI.
+Its default CUDA target is Ada (`CUDA_ARCHS=89`). On another GPU, add
+`--build-arg CUDA_ARCHS=<compute capability without the dot>`; for example,
+`120` for a GPU reporting capability `12.0`. Use Docker with NVIDIA GPU support.
+The existing Docker Compose configuration does not launch this FLUX example.
 
-Start the FLUX worker and Dynamo frontend:
+### Tune offline
+
+Create persistent host directories and open the image:
+
+```bash
+mkdir -p flux-artifacts precision-results
+docker run --rm -it --gpus all --shm-size 8g \
+  -v dynamo-flux2-klein-hf-cache:/root/.cache/huggingface \
+  -v "$(pwd)/flux-artifacts:/artifacts" \
+  -v "$(pwd)/precision-results:/results" \
+  dynamo-glos-flux2-klein:latest bash
+```
+
+Inside the container:
+
+```bash
+python deploy/tune_flux.py --precision bf16 --artifact-dir /artifacts/bf16
+```
+
+Every invocation loads the model and runs AI Tune again. Existing artifacts do
+not skip tuning. Without `--artifact-dir`, the default is
+`flux-artifacts/<precision>` relative to the working directory.
+Use `--size`, `--steps`, and `--max-image-side` to set the tuning workload and
+shape bounds (defaults: `1024x1024`, four steps, maximum side 2048).
+
+Normal tuning evaluates AI Tune's default candidates with their default compiler
+settings. It selects the fastest successful candidate, even if eager is faster.
+An optional `--backend <ID>` isolates a candidate for diagnostics; discover IDs
+with `python deploy/check_precision_backends.py --list-backends`.
+
+The artifact directory contains `manifest.json` and versioned checkpoint/build
+subdirectories under `runs/`. A successful save atomically publishes the new
+manifest. A failed tuning attempt leaves an earlier published artifact intact;
+its logs/report identify the failed attempt. Eager fallback is never published
+as an optimized artifact. Each attempt records overall tuning time and backend
+build times in `runs/<run>/tuning.json`; the manifest records successful results.
+
+Image checks compare generation, editing, and a held-out prompt with eager at
+the same precision and seeds. The pixel RMSE limit is 0.05 on values scaled to
+[0, 1]. Image mismatches are logged and saved as `Validation: FAIL`, but the
+compiled artifact is still published. The command exits with status 1 for a
+mismatch; the printed artifact path remains usable and serving logs a warning.
+
+### Start the server
+
+Exit the tuning container. On the host, start the worker with the artifact path:
 
 ```bash
 docker run -d --name dynamo-glos-flux2-klein \
-  --gpus all --shm-size 8g \
-  -p 127.0.0.1:8000:8000 \
+  --gpus all --shm-size 8g -p 127.0.0.1:8000:8000 \
   -e DYN_DISCOVERY_BACKEND=file -e DYN_EVENT_PLANE=zmq \
   -e DYN_FILE_KV=/tmp/dynamo-discovery \
   -v dynamo-flux2-klein-hf-cache:/root/.cache/huggingface \
+  -v "$(pwd)/flux-artifacts:/artifacts:ro" \
   dynamo-glos-flux2-klein:latest \
-  python deploy/flux_image_worker.py --precision bf16 --use-aitune
+  python deploy/flux_image_worker.py --artifact-dir /artifacts/bf16
 
 docker exec -d dynamo-glos-flux2-klein \
   python -m dynamo.frontend --http-host 0.0.0.0 --http-port 8000 \
   --discovery-backend file --request-plane tcp --event-plane zmq
 ```
 
-Startup includes tuning, output validation, and warmup. Wait until the response
-below lists `black-forest-labs/FLUX.2-klein-4B` in `data`; HTTP 200 with an empty
-list does not mean the model is ready. Use `docker logs -f dynamo-glos-flux2-klein`
-to follow startup progress.
+The artifact supplies the model, precision, startup size, denoising steps, and
+maximum image side unless overridden. Explicit model/precision mismatches fail.
+Missing files, failed integrity checks, incompatible package versions or GPU
+targets, and activation/warmup failures also stop startup. There is no retuning
+or eager fallback. Build and serve with the same image and GPU type.
+
+To run **without AI Tune**, replace the worker command above with:
+
+```bash
+python deploy/flux_image_worker.py --precision bf16
+```
+
+Without `--artifact-dir`, `torch.compile` is always enabled. Use
+`--torch-compile-mode` to select its mode (`default` by default). The legacy
+`--torch-compile` flag is still accepted but unnecessary. `--use-aitune` has
+been replaced by `--artifact-dir`.
+
+Both modes warm generation and editing before registration; `--warmup` must be
+at least one. Worker logs show model-loading time, warmup time, total pipeline
+startup time, and PyTorch-reported startup compilation time.
+
+**AoT versus JIT artifacts:** ahead-of-time artifacts load compiled code. JIT
+artifacts still compile when activated, even though backend selection is saved.
+The default strategy can select either; inspect `backends[].build_mode` in the
+manifest. Persistent compiler caches can shorten JIT startup, but do not turn it
+into AoT loading. The text encoder and VAE are still loaded for every server.
+
+Wait until the model appears in `data`, then generate an image:
 
 ```bash
 curl -fsS http://localhost:8000/v1/models
-```
-
-#### Image generation
-
-Generate an image and save it as `generated.png`:
-
-```bash
 curl --fail-with-body -sS http://localhost:8000/v1/images/generations \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "black-forest-labs/FLUX.2-klein-4B",
-    "prompt": "A red fox in a sunny alpine meadow",
-    "size": "1024x1024",
-    "response_format": "b64_json",
-    "nvext": {"num_inference_steps": 4, "guidance_scale": 1.0, "seed": 42}
-  }' > response.json
+  -d '{"model":"black-forest-labs/FLUX.2-klein-4B","prompt":"A red fox in a sunny alpine meadow","size":"1024x1024","response_format":"b64_json","nvext":{"num_inference_steps":4,"guidance_scale":1.0,"seed":42}}' \
+  > response.json
 
 docker exec -i dynamo-glos-flux2-klein python -c \
   'import sys,json,base64; r=json.load(sys.stdin); sys.stdout.buffer.write(base64.b64decode(r["data"][0]["b64_json"]))' \
   < response.json > generated.png
 ```
 
-For editing, send JSON to `/v1/images/edits` with `input_reference` containing
-an image data URL or an allowed HTTPS image URL. Both endpoints use the selected
-transformer backend, including eager fallback if compilation fails.
-Ahead-of-time (AoT) input-shape bounds follow the
-worker's `--max-image-side` setting and include both generation and editing.
+Editing uses `/v1/images/edits` with an `input_reference` image data URL or an
+allowed HTTPS image URL. An empty model list does not mean the worker is ready.
+Follow startup with `docker logs -f dynamo-glos-flux2-klein`.
 
-### Check and benchmark precisions and backends
+### Precision
 
-After building the image, open a container with an output directory mounted from
-the host. Run this on an idle GPU; each combination loads the full model and
-compilation can take several minutes.
+| Precision | Transformer | Hardware |
+| --- | --- | --- |
+| `bf16` | BF16 weights and computation | BF16-capable CUDA GPU |
+| `fp16` | FP16 transformer, with BF16 pipeline boundary conversion | BF16-capable CUDA GPU |
+| `fp8` | Calibrated BFL E4M3 checkpoint with saved weight and activation scales | Compute capability 8.9+ |
+| `fp4` / `nvfp4` | Calibrated NVIDIA NVFP4 checkpoint | Blackwell, compute capability 10.0+ |
+
+The text encoder and VAE remain BF16. FP8/NVFP4 use TorchAO native linear
+operations behind custom PyTorch operators, with native LayerNorm/RMSNorm.
+Inductor can compile around these operations. TensorRT candidates may fail to
+export unsupported custom operations or FP64 positional embeddings; the matrix
+records these failures. Quantized compiled images can differ from eager and
+remain benchmarkable with the mismatch visible.
+
+### Benchmark all configurations
+
+Open the interactive container with `/artifacts` and `/results` mounted as above,
+then run:
 
 ```bash
-mkdir -p precision-results
-docker run --rm -it --gpus all --shm-size 8g \
-  -v dynamo-flux2-klein-hf-cache:/root/.cache/huggingface \
-  -v "$(pwd)/precision-results:/results" \
-  dynamo-glos-flux2-klein:latest bash
+python deploy/check_precision_backends.py \
+  --artifact-dir /artifacts/matrix \
+  --output-dir /results \
+  --benchmark-warmup 3 --benchmark-requests 30
 ```
 
-Inside the container, run:
+The default matrix includes BF16, FP16, FP8, FP4, an eager diagnostic baseline,
+a **no-AI-Tune torch.compile server**, and every installed default AI Tune
+candidate. Unsupported precisions are skipped. Each AI Tune combination is tuned
+and serialized in one process. That process exits before a fresh server loads
+the artifact and is benchmarked through Dynamo HTTP. Image mismatches do not
+block benchmarks. Compilation failures and eager fallback do.
 
-```bash
-python deploy/check_precision_backends.py --output-dir /results
-```
-
-The script tests BF16, FP16, FP8, and FP4 (NVFP4), each against eager execution
-and every default candidate discovered from the installed AI Tune package.
-It isolates candidates for this diagnostic without overriding their compiler
-settings or changing normal service startup. Unsupported hardware combinations
-are marked `SKIP`, so FP4 is skipped on Ada.
-
-The table is printed after each combination and saved as `results.md` in a new
-timestamped directory under `precision-results` on the host. `results.json`
-also records the GPU, package versions, candidate configurations, timings, and
-errors. Each combination has its own `run.log`, AI Tune artifacts, and output PNGs.
-After a configuration completes its image checks, the script serves that loaded model
-through a temporary Dynamo worker endpoint and frontend, then benchmarks
-`/v1/images/generations`. The frontend binds to a dynamically chosen localhost
-port; no additional Docker port mapping is needed. Each case uses isolated file
-discovery, and its services stop before the next case starts.
-
-The columns have distinct meanings:
-
-- **Compile**: `PASS` means AI Tune built, checked, profiled, and selected the
-  isolated candidate. This exercises deferred JIT compilation too. Eager fallback
-  is a failure for that candidate, and eager's own row shows `N/A`.
-- **Generation / Editing**: `PASS` means the selected backend produced and saved
-  that image. It does not establish numerical correctness.
-- **Validation**: `PASS` means the worker's generation, editing, and held-out
-  images passed the same-seed, same-precision eager comparison described below.
-  Eager's own row shows `N/A` and checks image dimensions and nonuniform pixels.
-  Image mismatches are logged as `FAIL` but do not prevent diagnostic benchmarking.
-  The normal serving worker still rejects these mismatches during startup.
-- **Benchmark**: `PASS` means all warmup and measured HTTP requests succeeded
-  and returned decodable images of the requested size. Compilation failures,
-  eager fallback, and inference errors prevent benchmarking that candidate.
-- **Result**: the overall outcome, including loading failures. `NOT RUN` in a
-  stage means an earlier failure prevented that check. See the row's log for
-  the underlying error. An image mismatch keeps the overall result `FAIL` even
-  when benchmarking succeeds.
-
-Three additional tables report performance for each benchmarked precision/backend:
+The script prints and saves these tables:
 
 | Table | Measurement |
 | --- | --- |
-| HTTP latency | Mean, P50, and P95 milliseconds from sending a request to receiving its complete HTTP response, including image encoding and transfer |
-| Throughput | Successful images per second, from the first measured request to the last complete response, including client work between requests |
-| Worker generation time | Mean, P50, and P95 milliseconds for the pipeline call, including text encoding, denoising, and VAE decoding; CUDA is synchronized, and PNG encoding and transport are excluded |
+| Checks | Compilation, generation, editing, validation, artifact save, startup, and benchmark status |
+| HTTP latency | Mean/P50/P95 milliseconds from request send through complete response transfer |
+| Throughput | Successful images/second, first measured send to last complete response |
+| Generation time | Mean/P50/P95 milliseconds for the synchronized worker pipeline call, excluding PNG encoding and transport |
+| Tuning and startup | Overall tuning, backend builds, model loading, warmup, startup compilation, and total server startup, in seconds |
 
-By default, each case uses two unmeasured warmups and ten measured text-to-image
-requests, cycling through the same three prompts with deterministic seeds.
-Requests are serial, with one image per request, because this worker rejects
-concurrent requests. These numbers describe concurrency-one performance, not
-maximum saturated throughput. Model loading, compilation, service startup, and
-warmup are excluded from all three metrics. Percentiles use the nearest-rank
-method; increase the request count for more representative tail latency.
+**Timing boundaries:** overall tuning includes process launch, imports, loading,
+recording, building/profiling candidates, validation, and serialization. Backend
+build time surrounds AI Tune's backend build/export calls, including failures;
+it excludes strategy profiling and image comparison. Startup spans fresh-process
+launch to model visibility in `/v1/models`, after loading and generation/editing
+warmup, including frontend startup. PyTorch-reported frame compilation time is
+shown separately within startup. Warmup includes inference as well as any JIT
+compilation; these columns overlap and must not be added together.
 
-The tables appear both in the console and in `results.md`. Each case additionally
-saves `frontend.log`, `benchmark.json` with the summary, and `requests.jsonl` with
-individual timings, prompts, seeds, and warmup flags. A failed HTTP request
-invalidates that case's benchmark; partial samples remain in `requests.jsonl`.
-Each metric table includes the image-validation status, so results from a model
-that produces different images remain identifiable. Failed or skipped benchmarks
-have no performance numbers. Eager results are labeled as the untuned baseline.
+The default `--compiler-cache cold` gives each tuning and server process separate
+Inductor/Triton caches. This exposes compilation costs without reusing caches
+populated during tuning. Use `--compiler-cache warm` to reuse the environment's
+compiler caches and measure cached restarts. Downloaded model weights are reused
+in either mode. Disk/OS caches are not flushed. The eager baseline is diagnostic;
+the public no-artifact server always uses torch.compile.
 
-The timeout defaults to 1,800 seconds per combination, including model loading,
-tuning, and benchmarking. Each HTTP request has a 120-second timeout.
-A failure or timeout does not stop subsequent combinations. Exit status is `1`
-if any combination failed, `2` for setup errors, and `130` for an interrupted run;
-completed and skipped results remain saved. Each combination uses a fresh AI Tune
-cache, while lower-level compiler caches and downloaded weights may be reused.
+Performance requests are serial, one image per request, using the same three
+prompts and deterministic seeds. Startup and HTTP warmups are excluded from the
+performance metrics. Throughput includes client work between requests and is not
+maximum-concurrency throughput. Defaults are two warmups and ten measured
+requests; percentiles use nearest rank.
 
-To limit a run or identify individual default candidates:
+Results are saved in `/results/<timestamp>/results.md` and `results.json`.
+Artifacts are saved under `/artifacts/matrix/<timestamp>/<precision>-<backend>/`;
+pass that exact directory to the server's `--artifact-dir`. Each case has
+`tune.log`, `serve.log`, `frontend.log`, `benchmark.json`, and `requests.jsonl`
+when those stages run. Individual build timings and image mismatches are retained.
+Default host-relative artifact root: `flux-artifacts`.
+
+Useful options:
 
 ```bash
-python deploy/check_precision_backends.py --list-backends --output-dir /results
-python deploy/check_precision_backends.py --precisions fp8 fp4 --output-dir /results
-python deploy/check_precision_backends.py --precisions bf16 --backends eager --output-dir /results
-python deploy/check_precision_backends.py --precisions bf16 --benchmark-requests 30 --benchmark-warmup 3 --output-dir /results
+python deploy/check_precision_backends.py --list-backends
+python deploy/check_precision_backends.py --precisions fp8 fp4 --artifact-dir /artifacts/matrix --output-dir /results
+python deploy/check_precision_backends.py --precisions bf16 --backends torch_compile 3 --artifact-dir /artifacts/matrix --output-dir /results
 ```
 
-`--backends` also accepts the numeric IDs printed by `--list-backends`. IDs
-distinguish different configurations of the same backend class. Use `--timeout`
-to allow longer compilation, or `--size` and `--steps` to change the workload
-(defaults: `1024x1024`, four steps). Results apply to the tested workload and
-environment, not all image sizes or GPU architectures.
-Use `--request-timeout` for slower HTTP requests. To run only the original
-compilation and image checks, set `--benchmark-requests 0`.
-
-### Details
-
-#### Build
-
-`Dockerfile.aitune` builds an independent FLUX image directly from NVIDIA's CUDA
-13.1.1 development image. It installs AI Tune 0.6.0 from PyPI; no AI Tune checkout
-or other example image is needed.
-Use the launch commands above; the existing Docker Compose configuration does
-not launch this FLUX example.
-
-The image installs Python 3.12, PyTorch 2.11.0, Diffusers, Transformers, and TorchAO
-explicitly, together with AI Tune's `torch211` extra.
-
-This FLUX worker uses image-accounting types absent from the tested released
-Dynamo wheels, so the image also builds Dynamo from this checkout.
-The source build defaults to Ada (`CUDA_ARCHS=89`); set
-`--build-arg CUDA_ARCHS=<architecture>` for another GPU.
-
-Installing AI Tune does not enable tuning by itself: the worker's
-`--use-aitune` flag controls that separately.
-
-#### Precision and tuning
-
-Choose the transformer precision with `--precision`:
-
-| `--precision` | Transformer execution | Hardware |
-| --- | --- | --- |
-| `bf16` (default) | BF16 weights and computation | BF16-capable CUDA GPU |
-| `fp16` | FP16 weights and computation, with BF16 pipeline inputs/outputs converted at the transformer boundary | BF16-capable CUDA GPU for the text encoder and VAE |
-| `fp8` | Pretrained BFL FP8 E4M3 transformer weights with saved weight and activation scales; unquantized layers remain BF16 | Ada or newer (compute capability 8.9+) |
-| `fp4` or `nvfp4` | The same pretrained NVIDIA NVFP4 transformer checkpoint | Blackwell (compute capability 10.0+) |
-
-For example, use `--precision fp8 --use-aitune` to tune the FP8 transformer.
-The text encoder and VAE remain BF16 for every choice. Precision is applied before
-tuning, and eager fallback keeps that precision. Tuning does not automatically
-choose among precisions.
-
-FP8 and NVFP4 linear layers keep packed weights and scales as ordinary tensors.
-A custom PyTorch operator invokes TorchAO's native quantization and matrix
-multiplication, keeping its Python tensor wrappers outside compiler tracing.
-This permits Inductor export without converting the weights back to BF16, but
-prevents compiler fusion across those linear operations. Both precisions use
-the calibration scales saved in their checkpoints. `fp8` downloads
-`black-forest-labs/FLUX.2-klein-4b-fp8`; it does not quantize BF16 weights at startup.
-Quantized transformers also retain native LayerNorm/RMSNorm kernels to limit
-numerical differences at quantization boundaries.
-
-Earlier FP8 generation and editing checks used explicit Inductor compiler
-settings; those results do not establish correctness with the defaults.
-NVFP4 checkpoint loading and full-model strict export were validated; native
-NVFP4 execution and image quality require a Blackwell run.
-
-AI Tune uses its default backend candidates and compiler settings. The example
-does not specify a backend list or compiler overrides. It selects the fastest
-successful candidate, even if eager execution is faster. If all candidates fail,
-it logs an `ERROR` with the candidate
-results and log paths, then falls back to eager execution at the selected precision.
-The selected backend must pass output validation before the model is registered.
-Validation compares generation, editing, and a held-out prompt against eager
-outputs at the same precision and seeds, with a maximum pixel RMSE of 0.05 on
-values scaled to [0, 1]. A validation failure stops startup.
-Successful image generation alone does not prove that a compiled backend worked:
-check the `Serving transformer` log entry for the selected backend.
-
-`--use-aitune` and the existing JIT `--torch-compile` option are mutually exclusive.
-`--torch-compile-mode` applies only to the latter.
-
-There is no separate tuning command, checkpoint argument, or tuning volume.
-With AI Tune enabled, each worker start selects and validates a transformer backend.
-Build artifacts and compiler caches use the existing Hugging Face cache volume.
-JIT backends compile during tuning and warmup and may compile again for new inputs.
+Numeric backend IDs come from `--list-backends`; `eager` and `torch_compile` are
+named baselines. `--size` and `--steps` select the workload. `--timeout` defaults
+to 1,800 seconds per combination, covering tuning and serving; individual HTTP
+requests use `--request-timeout` (120 seconds). `--benchmark-requests 0` tunes
+and saves artifacts without starting servers or measuring startup/performance.
+Failures do not stop subsequent combinations. Exit codes: 1 for any failed check
+(including image mismatches), 2 for argument/discovery errors, 130 for interruption.
+Completed tables and partial diagnostics remain saved.

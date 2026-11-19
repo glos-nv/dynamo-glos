@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Benchmark a loaded FLUX worker through a temporary local Dynamo frontend.
+"""Start and benchmark a fresh FLUX worker through a local Dynamo frontend.
 
 Used by check_precision_backends.py after image checks, including mismatches.
 All requests are serial:
@@ -142,15 +142,15 @@ async def _measure(base_url, backend, directory, options, generation_times):
     return result
 
 
-async def _serve_and_measure(backend, directory, options):
+async def _serve_and_measure(
+    backend, directory, options, startup_started, ready_callback
+):
     import torch
     from dynamo.runtime import DistributedRuntime
     from flux_image_worker import _get_worker_namespace, _register_model
 
     # The case runner supplies isolated file discovery and namespace settings.
-    runtime = DistributedRuntime(
-        asyncio.get_running_loop(), "file", "tcp", event_plane="zmq"
-    )
+    runtime = None
     serving = None
     frontend = None
     generation_times = []
@@ -166,6 +166,10 @@ async def _serve_and_measure(backend, directory, options):
 
     with (directory / "frontend.log").open("w") as log:
         try:
+            await backend.initialize_model()
+            runtime = DistributedRuntime(
+                asyncio.get_running_loop(), "file", "tcp", event_plane="zmq"
+            )
             endpoint = runtime.endpoint(f"{_get_worker_namespace()}.backend.generate")
             serving = asyncio.ensure_future(
                 endpoint.serve_endpoint(backend.create_image)
@@ -217,10 +221,17 @@ async def _serve_and_measure(backend, directory, options):
                         "Model not ready in Dynamo after 60s; see frontend.log"
                     )
                 await asyncio.sleep(0.25)
+            startup_seconds = time.perf_counter() - startup_started
+            ready_callback(startup_seconds, backend.startup_timings)
             with patch.object(backend, "_run", timed_run):
-                return await _measure(
+                result = await _measure(
                     base_url, backend, directory, options, generation_times
                 )
+            result.update(startup_seconds=startup_seconds, **backend.startup_timings)
+            (directory / "benchmark.json").write_text(
+                json.dumps(result, indent=2) + "\n"
+            )
+            return result
         finally:
             if frontend is not None:
                 if frontend.returncode is None:
@@ -230,15 +241,16 @@ async def _serve_and_measure(backend, directory, options):
                 except TimeoutError:
                     frontend.kill()
                     await frontend.wait()
-            runtime.shutdown()
+            if runtime is not None:
+                runtime.shutdown()
             if serving is not None:
                 serving.cancel()
                 await asyncio.gather(serving, return_exceptions=True)
             await backend.close()
 
 
-def benchmark_dynamo(backend, directory, options):
-    """Serve the loaded model and measure warmed HTTP generation.
+def benchmark_dynamo(backend, directory, options, *, startup_started, ready_callback):
+    """Initialize an unloaded worker, measure readiness, then HTTP generation.
 
     Latency spans the HTTP request through receipt of the full response body.
     Generation time surrounds the worker's pipeline call, synchronized on CUDA,
@@ -247,4 +259,6 @@ def benchmark_dynamo(backend, directory, options):
     response, including client work between requests. Warmups and startup are
     excluded. Failed requests invalidate the run; raw completed samples survive.
     """
-    return asyncio.run(_serve_and_measure(backend, directory, options))
+    return asyncio.run(
+        _serve_and_measure(backend, directory, options, startup_started, ready_callback)
+    )

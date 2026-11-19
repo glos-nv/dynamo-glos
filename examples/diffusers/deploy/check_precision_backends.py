@@ -32,9 +32,17 @@ import traceback
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
 
-STAGES = ("load", "compile", "generation", "editing", "validation", "benchmark")
+STAGES = (
+    "load",
+    "compile",
+    "generation",
+    "editing",
+    "validation",
+    "artifact",
+    "startup",
+    "benchmark",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -71,7 +79,16 @@ def _discover(path):
             },
             "unsupported": unsupported,
             "backends": [
-                {"id": "eager", "name": "Eager", "description": "Untuned baseline"},
+                {
+                    "id": "eager",
+                    "name": "Eager",
+                    "description": "Untuned diagnostic baseline",
+                },
+                {
+                    "id": "torch_compile",
+                    "name": "torch.compile (no AI Tune)",
+                    "description": "Default server without artifacts",
+                },
                 *[
                     {
                         "id": str(index),
@@ -85,160 +102,73 @@ def _discover(path):
     )
 
 
-def _run_case(path):
-    """Record completed phases even if a later compiler or image check fails."""
+def _run_tune_case(path):
+    """Tune and serialize in a process that exits before server startup."""
+    from tune_flux import run_tuning
+
     row = json.loads(path.read_text())
-    directory = path.parent
-    phase = "load"
+    run_tuning(
+        artifact_dir=row["artifact_dir"],
+        precision=row["precision"],
+        size=row["size"],
+        steps=row["steps"],
+        backend_id=row["backend"]["id"],
+        report=row,
+        report_path=path,
+        started=float(os.environ["FLUX_PROCESS_STARTED_AT"]),
+    )
 
-    def save():
-        row["phase"] = phase
-        _write_json(path, row)
 
+def _run_serve_case(path):
+    """Measure a new server process, never reusing a pipeline from tuning."""
+    row = json.loads(path.read_text())
+    row.update(phase="startup", status="PENDING")
+    _write_json(path, row)
     try:
-        import flux_aitune
-        import flux_image_worker as worker
-        import numpy as np
-        import torch
-        from aitune.torch.backend import TorchEagerBackend
+        from flux_benchmark import benchmark_dynamo
+        from flux_image_worker import FluxImageBackend, _parse_args
 
-        eager = row["backend"]["id"] == "eager"
         argv = [
-            "flux_image_worker.py",
             "--precision",
             row["precision"],
             "--default-size",
             row["size"],
             "--default-num-inference-steps",
             str(row["steps"]),
-            "--warmup",
-            "0",
         ]
-        if not eager:
-            argv.append("--use-aitune")
-        with patch.object(sys, "argv", argv):
-            args = worker._parse_args()
-        backend = worker.FluxImageBackend(args)
-        width, height = backend._parse_size(args.default_size)
-        real_strategy = flux_aitune.ait.MinLatencyStrategy
-        real_tune = flux_aitune.tune_transformer
-        real_selection = flux_aitune._validate_backend_selection
-        real_validate = flux_aitune._validate_image
-        checked = 0
+        if row["server_mode"] == "aitune":
+            argv.extend(["--artifact-dir", row["artifact_dir"]])
+        backend = FluxImageBackend(_parse_args(argv))
+        if row["backend"]["id"] == "eager":
+            # Explicit diagnostic baseline only; the public server defaults to JIT.
+            backend._load = backend._load_pipeline
+            backend.execution_mode = "eager (diagnostic)"
 
-        def strategy_factory(**kwargs):
-            strategy = real_strategy(**kwargs)
-            candidate = strategy._backends[int(row["backend"]["id"]) - 1]
-            if candidate.describe() != row["backend"]["description"]:
-                raise RuntimeError(
-                    "Default backend configuration changed since discovery"
+        def ready(startup_seconds, timings):
+            row.update(startup="PASS", startup_seconds=startup_seconds, **timings)
+            if row["server_mode"] != "aitune":
+                row.update(load="PASS", generation="PASS", editing="PASS")
+                row["compile"] = (
+                    "PASS" if row["backend"]["id"] == "torch_compile" else "N/A"
                 )
-            strategy._backends_override = [candidate]
-            return strategy
+            row["phase"] = "benchmark"
+            _write_json(path, row)
 
-        def tune(pipe, **kwargs):
-            nonlocal phase
-            row["load"] = "PASS"
-            phase = "compile"
-            save()
-            return real_tune(pipe, **kwargs)
-
-        def selection(transformer, strategy):
-            nonlocal phase
-            selected = real_selection(transformer, strategy)
-            row["candidate_results"] = strategy.backend_results
-            if any(isinstance(item, TorchEagerBackend) for item in selected):
-                raise RuntimeError("Candidate failed; AI Tune selected eager fallback")
-            # Selection follows build, correctness checks and profiling. This
-            # also exercises lazy JIT compilation, unlike build() alone.
-            row["compile"] = "PASS"
-            phase = "generation"
-            save()
-            return selected
-
-        def validate(actual, expected):
-            nonlocal checked, phase
-            label = ("generation", "editing", "held-out")[checked]
-            actual.save(directory / f"{label}.png")
-            if checked < 2:
-                row[label] = "PASS"
-            phase = "validation"
-            save()
-            try:
-                real_validate(actual, expected)
-            except RuntimeError as error:
-                # Image agreement and execution speed are independent results.
-                # Keep the compiled candidate for diagnostic benchmarking.
-                row["validation"] = "FAIL"
-                row.setdefault("validation_errors", []).append(
-                    {"case": label, "error": str(error)}
-                )
-                logger.warning(
-                    "%s image validation failed: %s; continuing diagnostic checks and benchmark",
-                    label,
-                    error,
-                )
-            checked += 1
-            if checked == 3 and row["validation"] != "FAIL":
-                row["validation"] = "PASS"
-            phase = "editing" if checked == 1 else "validation"
-            save()
-
-        try:
-            with (
-                patch.object(flux_aitune.ait, "MinLatencyStrategy", strategy_factory),
-                patch.object(flux_aitune, "tune_transformer", tune),
-                patch.object(flux_aitune, "_validate_backend_selection", selection),
-                patch.object(flux_aitune, "_validate_image", validate),
-            ):
-                backend.pipe = backend._load()
-            if eager:
-                row["load"] = "PASS"
-                reference = None
-                for phase, prompt in (
-                    ("generation", "A red fox in a sunny alpine meadow"),
-                    ("editing", "Turn this image into a watercolor painting"),
-                ):
-                    save()
-                    with torch.inference_mode():
-                        result = backend._run(
-                            prompt,
-                            reference,
-                            width,
-                            height,
-                            args.default_num_inference_steps,
-                            args.default_guidance_scale,
-                            42,
-                        )
-                    pixels = np.asarray(result)
-                    if result.size != (width, height) or pixels.std() == 0:
-                        raise RuntimeError(
-                            "Image has an incorrect size or is uniformly colored"
-                        )
-                    result.save(directory / f"{phase}.png")
-                    row[phase] = "PASS"
-                    reference = result
-            if row["benchmark_options"]["requests"]:
-                from flux_benchmark import benchmark_dynamo
-
-                phase = "benchmark"
-                save()
-                row["benchmark_metrics"] = benchmark_dynamo(
-                    backend, directory, row["benchmark_options"]
-                )
-                row["benchmark"] = "PASS"
-            else:
-                row["benchmark"] = "DISABLED"
-            row["status"] = "FAIL" if row["validation"] == "FAIL" else "PASS"
-        finally:
-            backend._executor.shutdown(wait=True)
-    except Exception as error:  # noqa: BLE001 - record failures from optional compilers
-        row[phase] = "FAIL"
-        row["status"] = "FAIL"
-        row["error"] = f"{type(error).__name__}: {error}"
+        row["benchmark_metrics"] = benchmark_dynamo(
+            backend,
+            path.parent,
+            row["benchmark_options"],
+            startup_started=float(os.environ["FLUX_PROCESS_STARTED_AT"]),
+            ready_callback=ready,
+        )
+        row["benchmark"] = "PASS"
+        row["status"] = "FAIL" if row["validation"] == "FAIL" else "PASS"
+    except Exception as error:  # noqa: BLE001 - persist subprocess diagnostics
+        row[row["phase"]] = "FAIL"
+        row.update(status="FAIL", error=f"{type(error).__name__}: {error}")
         traceback.print_exc()
     finally:
-        save()
+        _write_json(path, row)
 
 
 def _subprocess(arguments, log, timeout, env=None):
@@ -248,7 +178,10 @@ def _subprocess(arguments, log, timeout, env=None):
             [sys.executable, str(Path(__file__).resolve()), *arguments],
             stdout=stream,
             stderr=subprocess.STDOUT,
-            env=env,
+            env={
+                **(env if env is not None else os.environ),
+                "FLUX_PROCESS_STARTED_AT": str(time.perf_counter()),
+            },
             start_new_session=True,
         )
         try:
@@ -337,6 +270,47 @@ def _metric_tables(rows):
     return "\n\n".join(tables)
 
 
+def _startup_table(rows):
+    def seconds(row, key):
+        return f"{row[key]:.3f}" if key in row else "--"
+
+    records = []
+    for row in rows:
+        build_modes = sorted(
+            {backend["build_mode"] for backend in row.get("backends", [])}
+        )
+        mode = "/".join(build_modes) or row["server_mode"]
+        records.append(
+            (
+                row["precision"],
+                row["backend"]["name"],
+                mode,
+                seconds(row, "tuning_seconds"),
+                seconds(row, "compilation_seconds"),
+                seconds(row, "model_load_seconds"),
+                seconds(row, "warmup_seconds"),
+                seconds(row, "startup_compilation_seconds"),
+                seconds(row, "startup_seconds"),
+                row["startup"],
+            )
+        )
+    return "### Tuning and server startup (seconds)\n\n" + _table(
+        (
+            "Precision",
+            "Backend",
+            "Mode",
+            "Overall tuning",
+            "Backend build",
+            "Model load",
+            "Warmup",
+            "Startup compile",
+            "Server startup",
+            "Startup",
+        ),
+        records,
+    )
+
+
 def _report(directory, metadata, rows):
     columns = (
         "Precision",
@@ -345,6 +319,8 @@ def _report(directory, metadata, rows):
         "Generation",
         "Editing",
         "Validation",
+        "Artifact",
+        "Startup",
         "Benchmark",
         "Result",
     )
@@ -356,6 +332,8 @@ def _report(directory, metadata, rows):
             row["generation"],
             row["editing"],
             row["validation"],
+            row["artifact"],
+            row["startup"],
             row["benchmark"],
             row["status"],
         )
@@ -363,9 +341,14 @@ def _report(directory, metadata, rows):
     ]
     table = _table(columns, records)
     metrics = _metric_tables(rows)
+    startup = _startup_table(rows)
     details = "\n".join(
         f"- {row['precision']} / {row['backend']['name']}: {row['error']}"
-        + (f" (log: {row['directory']}/run.log)" if row["status"] != "SKIP" else "")
+        + (
+            f" (logs: {row['directory']}/tune.log, {row['directory']}/serve.log)"
+            if row["status"] != "SKIP"
+            else ""
+        )
         for row in rows
         if row.get("error")
     )
@@ -377,11 +360,19 @@ def _report(directory, metadata, rows):
     report = (
         f"GPU: {metadata['gpu']}\n\n"
         f"Workload: {rows[0]['size']}, {rows[0]['steps']} steps, batch size 1.\n\n"
+        f"Total recorded offline tuning: {sum(row.get('tuning_seconds', 0) for row in rows):.3f} seconds.\n\n"
         f"{table}\n\n"
         "Compile includes AI Tune build, checks, and profiling. Eager fallback "
         "does not count as success. Validation compares images with eager at "
         "the same precision; it is not a comparison with BF16.\n\n"
         f"{metrics}\n\n"
+        f"{startup}\n\n"
+        f"Compiler cache policy: {rows[0]['compiler_cache']}. Startup is measured in a fresh process "
+        "from launch to model visibility in /v1/models, after generation/editing warmup. "
+        "AoT loads compiled artifacts; JIT artifacts and no-AI-Tune servers compile on startup. "
+        "Backend build measures AI Tune's build/export calls, including failed attempts. "
+        "Startup compile is PyTorch-reported frame compilation time within startup. "
+        "Warmup includes inference and any JIT compilation; it is not compiler-only time.\n\n"
         "Benchmarks use serial text-to-image HTTP requests. Startup and warmups "
         "are excluded. Generation time excludes PNG encoding and transport; "
         "latency includes the full response transfer. Throughput includes client "
@@ -394,12 +385,25 @@ def _report(directory, metadata, rows):
     _write_json(directory / "results.json", {"environment": metadata, "results": rows})
     print(table, flush=True)
     print("\n" + metrics, flush=True)
+    print("\n" + startup, flush=True)
 
 
 def main():
     """Print and save a sequential precision/backend matrix; failures return 1."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("precision-results"))
+    parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        default=Path("flux-artifacts"),
+        help="Root for persistent artifacts, grouped by run and configuration",
+    )
+    parser.add_argument(
+        "--compiler-cache",
+        choices=("cold", "warm"),
+        default="cold",
+        help="Cold isolates compiler caches for each tuning and server process; warm reuses environment caches",
+    )
     parser.add_argument(
         "--precisions",
         nargs="+",
@@ -434,7 +438,8 @@ def main():
         "--timeout", type=int, default=1800, help="Seconds per combination"
     )
     parser.add_argument("--_discover", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--_case", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--_tune-case", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--_serve-case", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -442,8 +447,11 @@ def main():
     if args._discover:
         _discover(args._discover)
         return 0
-    if args._case:
-        _run_case(args._case)
+    if args._tune_case:
+        _run_tune_case(args._tune_case)
+        return 0
+    if args._serve_case:
+        _run_serve_case(args._serve_case)
         return 0
     try:
         width, height = (int(part) for part in args.size.split("x"))
@@ -510,8 +518,19 @@ def main():
                 status="PENDING",
                 phase="load",
             )
+            row["server_mode"] = (
+                "aitune"
+                if backend["id"] not in ("eager", "torch_compile")
+                else "no-aitune"
+            )
+            row["compiler_cache"] = args.compiler_cache
+            row["artifact_dir"] = str(
+                args.artifact_dir.resolve() / directory.name / case_dir.name
+            )
+            if row["server_mode"] != "aitune":
+                row.update(artifact="N/A", validation="N/A")
             if backend["id"] == "eager":
-                row.update(compile="N/A", validation="N/A")
+                row["compile"] = "N/A"
             case_path = case_dir / "result.json"
             _write_json(case_path, row)
             rows.append(row)
@@ -520,30 +539,63 @@ def main():
                 row.update(status="SKIP", error=metadata["unsupported"][precision])
             else:
                 print(
-                    f"Checking {precision} / {backend['name']} (log: {case_dir / 'run.log'})",
+                    f"Checking {precision} / {backend['name']} (logs: {case_dir})",
                     flush=True,
                 )
                 started = time.monotonic()
                 interrupted = False
                 failure = None
                 try:
-                    code = _subprocess(
-                        ["--_case", str(case_path)],
-                        case_dir / "run.log",
-                        args.timeout,
-                        env={
-                            **os.environ,
-                            "AITUNE_CACHE_DIR": str(case_dir / "aitune"),
-                            "PYTHONUNBUFFERED": "1",
-                            "DYN_DISCOVERY_BACKEND": "file",
-                            "DYN_EVENT_PLANE": "zmq",
-                            "DYN_FILE_KV": str(case_dir / "discovery"),
-                            "DYN_NAMESPACE": "flux-bench-" + uuid.uuid4().hex,
-                            "DYN_SYSTEM_PORT": "-1",
-                        },
+                    env = {
+                        **os.environ,
+                        "PYTHONUNBUFFERED": "1",
+                        "DYN_DISCOVERY_BACKEND": "file",
+                        "DYN_EVENT_PLANE": "zmq",
+                        "DYN_FILE_KV": str(case_dir / "discovery"),
+                        "DYN_NAMESPACE": "flux-bench-" + uuid.uuid4().hex,
+                        "DYN_SYSTEM_PORT": "-1",
+                    }
+                    phases = (
+                        ["tune", "serve"]
+                        if row["server_mode"] == "aitune"
+                        else ["serve"]
                     )
-                    if code:
-                        failure = f"Child exited with code {code}"
+                    for phase in phases:
+                        if phase == "serve" and not args.benchmark_requests:
+                            row["benchmark"] = "DISABLED"
+                            if row["status"] == "PENDING":
+                                row["status"] = "PASS"
+                            _write_json(case_path, row)
+                            break
+                        phase_env = dict(env)
+                        if args.compiler_cache == "cold":
+                            phase_env.update(
+                                TORCHINDUCTOR_CACHE_DIR=str(
+                                    case_dir / phase / "inductor"
+                                ),
+                                TRITON_CACHE_DIR=str(case_dir / phase / "triton"),
+                            )
+                        phase_started = time.monotonic()
+                        remaining = args.timeout - (phase_started - started)
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(phase, args.timeout)
+                        code = _subprocess(
+                            [f"--_{phase}-case", str(case_path)],
+                            case_dir / f"{phase}.log",
+                            remaining,
+                            env=phase_env,
+                        )
+                        row.update(json.loads(case_path.read_text()))
+                        if phase == "tune":
+                            row["tuning_seconds"] = time.monotonic() - phase_started
+                            _write_json(case_path, row)
+                        if code:
+                            failure = f"{phase} process exited with code {code}"
+                            break
+                        if phase == "tune" and not row.get("artifact_saved"):
+                            failure = "Tuning did not publish an artifact"
+                            break
+
                 except subprocess.TimeoutExpired:
                     failure = f"TIMEOUT after {args.timeout} seconds"
                 except KeyboardInterrupt:
