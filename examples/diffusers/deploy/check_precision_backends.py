@@ -94,6 +94,7 @@ def _discover(path):
                         "id": str(index),
                         "name": f"{index}: {type(backend).__name__}",
                         "description": backend.describe(),
+                        "build_mode": backend.build_mode.name,
                     }
                     for index, backend in enumerate(candidates, 1)
                 ],
@@ -271,20 +272,38 @@ def _metric_tables(rows):
 
 
 def _startup_table(rows):
+    """Keep server selection separate from the backend's compilation lifecycle."""
+
     def seconds(row, key):
         return f"{row[key]:.3f}" if key in row else "--"
 
     records = []
     for row in rows:
-        build_modes = sorted(
-            {backend["build_mode"] for backend in row.get("backends", [])}
-        )
-        mode = "/".join(build_modes) or row["server_mode"]
+        if row["backend"]["id"] == "eager":
+            server_mode, compilation_type = "Diagnostic eager", "None"
+        elif row["server_mode"] == "no-aitune":
+            server_mode, compilation_type = "No AI Tune", "JIT"
+        else:
+            server_mode = "AI Tune"
+            # Discovery records the candidate type even when its build fails.
+            backends = row.get("backends") or [row["backend"]]
+            build_modes = sorted(
+                {
+                    backend["build_mode"]
+                    for backend in backends
+                    if "build_mode" in backend
+                }
+            )
+            labels = {"AHEAD_OF_TIME": "AoT", "JUST_IN_TIME": "JIT"}
+            compilation_type = (
+                "/".join(labels.get(mode, mode) for mode in build_modes) or "--"
+            )
         records.append(
             (
                 row["precision"],
                 row["backend"]["name"],
-                mode,
+                server_mode,
+                compilation_type,
                 seconds(row, "tuning_seconds"),
                 seconds(row, "compilation_seconds"),
                 seconds(row, "model_load_seconds"),
@@ -298,7 +317,8 @@ def _startup_table(rows):
         (
             "Precision",
             "Backend",
-            "Mode",
+            "Server mode",
+            "Compilation type",
             "Overall tuning",
             "Backend build",
             "Model load",

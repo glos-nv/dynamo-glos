@@ -178,6 +178,11 @@ The script prints and saves these tables:
 | Generation time | Mean/P50/P95 milliseconds for the synchronized worker pipeline call, excluding PNG encoding and transport |
 | Tuning and startup | Overall tuning, backend builds, model loading, warmup, startup compilation, and total server startup, in seconds |
 
+The timing table separates **Server mode** (`AI Tune`, `No AI Tune`, or
+`Diagnostic eager`) from **Compilation type** (`AoT`, `JIT`, or `None`).
+Failed candidates still show their declared compilation type; this does not
+indicate successful compilation. Check the compilation and startup status columns.
+
 **Timing boundaries:** overall tuning includes process launch, imports, loading,
 recording, building/profiling candidates, validation, and serialization. Backend
 build time surrounds AI Tune's backend build/export calls, including failures;
