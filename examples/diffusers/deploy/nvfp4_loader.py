@@ -199,7 +199,7 @@ def build_nvfp4_transformer(
             per_tensor_scale=parts["weight_scale_2"].to(device),
             act_per_tensor_scale=parts["input_scale"].to(device),
             _is_swizzled_scales=True,
-            use_triton_kernel=False,
+            use_triton_kernel=True,
             act_quant_kwargs=act_kw,
         )
         _set_module(model, path, NVFP4Linear(t, m.in_features, m.out_features))
