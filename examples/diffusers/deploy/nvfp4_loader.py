@@ -128,7 +128,7 @@ def load_nvfp4_state(ckpt_path, verbose=True):
 
 
 def _restore_nvfp4_weight(qdata, scale, per_tensor_scale, act_per_tensor_scale):
-    """Wrap saved tensors with the calibrated Klein NVFP4 execution policy."""
+    """Restore calibrated NVFP4 weights with Triton activation quantization."""
     from torchao.prototype.mx_formats.nvfp4_tensor import (
         NVFP4Tensor,
         QuantizeTensorToNVFP4Kwargs,
@@ -142,11 +142,12 @@ def _restore_nvfp4_weight(qdata, scale, per_tensor_scale, act_per_tensor_scale):
         per_tensor_scale=per_tensor_scale,
         act_per_tensor_scale=act_per_tensor_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
+        use_triton_kernel=True,
         act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(
             block_size=BLOCK,
             is_swizzled_scales=True,
-            use_triton_kernel=False,
+            # Fuse activation quantization and scale swizzling for each linear.
+            use_triton_kernel=True,
             use_dynamic_per_tensor_scale=False,
         ),
     )

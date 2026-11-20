@@ -144,6 +144,7 @@ Follow startup with `docker logs -f dynamo-glos-flux2-klein`.
 
 The text encoder and VAE remain BF16. FP8/NVFP4 use TorchAO native linear
 operations behind custom PyTorch operators, with native LayerNorm/RMSNorm.
+NVFP4 uses Triton for activation quantization and scale swizzling.
 Inductor can compile around these operations. TensorRT candidates may fail to
 export unsupported custom operations or FP64 positional embeddings; the matrix
 records these failures. Quantized compiled images can differ from eager and
