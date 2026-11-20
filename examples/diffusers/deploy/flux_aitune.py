@@ -28,9 +28,9 @@ import torch
 from aitune.torch.backend import Backend, TorchEagerBackend
 from aitune.torch.module.wrapper_module import ModuleState
 from aitune.torch.task.profiling import ProfilingConfig
+from skimage.metrics import structural_similarity
 
 logger = logging.getLogger(__name__)
-MAX_PIXEL_RMSE = 0.05
 
 
 def _contiguous_inputs(_module, args, kwargs):
@@ -60,6 +60,7 @@ def tune_transformer(
     report: dict,
     progress,
     output_dir,
+    min_ssim: float,
     backend_id: str | None = None,
 ) -> None:
     """Tune an eager pipeline in place, recording build times and image agreement.
@@ -86,12 +87,18 @@ def tune_transformer(
         report: Mutable result record including build timings and image checks.
         progress: Callback that persists the current report.
         output_dir: Directory for eager and compiled validation images.
+        min_ssim: Minimum RGB structural similarity required for image agreement.
         backend_id: Optional ID of an installed default candidate to isolate.
 
     Raises:
         RuntimeError: No optimized backend was selected or tuning did not complete.
     """
     logger.info("Optimizing the loaded transformer with AI Tune's default backends")
+    report["image_validation"] = {
+        "metric": "ssim",
+        "threshold": min_ssim,
+        "scores": {},
+    }
 
     def generate(prompt, *, image=None, seed=42):
         return pipe(
@@ -181,6 +188,7 @@ def tune_transformer(
     report["candidate_results"] = strategy.backend_results
     backends = _validate_backend_selection(pipe.transformer, strategy)
     report["compile"] = "PASS"
+    clip_cases = []
     for label, (request, expected) in zip(
         ("generation", "editing", "held-out"), validation_cases
     ):
@@ -189,10 +197,19 @@ def tune_transformer(
         actual = generate(**request)
         actual.save(output_dir / f"{label}.png")
         expected.save(output_dir / f"{label}-eager.png")
+        clip_cases.append((label, request["prompt"], expected, actual))
         if label != "held-out":
             report[label] = "PASS"
         try:
-            _validate_image(actual, expected)
+            score = _image_ssim(actual, expected)
+            report["image_validation"]["scores"][label] = score
+            logger.info(
+                "%s image agreement: SSIM=%.6f (minimum %.6f)", label, score, min_ssim
+            )
+            if score < min_ssim:
+                raise RuntimeError(
+                    f"Selected backend differs from baseline: SSIM={score:.6f} < {min_ssim:.6f}"
+                )
         except RuntimeError as error:
             report.setdefault("validation_errors", []).append(
                 {"case": label, "error": str(error)}
@@ -204,6 +221,11 @@ def tune_transformer(
             )
         report["validation"] = "FAIL" if report.get("validation_errors") else "PASS"
         progress()
+    # Run the auxiliary model only after generation and backend profiling finish.
+    from flux_clip import score_image_pairs
+
+    report["clip_score"] = score_image_pairs(clip_cases)
+    progress()
     logger.info("Tuned transformer: %s", [backend.describe() for backend in backends])
 
 
@@ -233,19 +255,36 @@ def _validate_backend_selection(transformer, strategy):
     return backends
 
 
-def _validate_image(actual, expected) -> None:
-    """Compare an output image with the same-seed, same-precision eager image.
+def _image_ssim(actual, expected) -> float:
+    """Return mean RGB SSIM against the same-seed, same-precision eager image.
 
-    Pixel RMSE is measured after scaling 8-bit pixel values to [0, 1]. Raise
-    ``RuntimeError`` for a shape mismatch, nonfinite output, or RMSE above
-    ``MAX_PIXEL_RMSE``. This is a startup regression check, not a quality score
-    against the original BF16 model.
+    Use an 11-pixel Gaussian window (sigma 1.5), population covariance, and
+    explicit range 1 for normalized pixels. Average the three channel scores.
+    This measures image agreement, not prompt adherence or overall quality.
+    Invalid images raise RuntimeError before scoring.
     """
     actual = np.asarray(actual, dtype=np.float32) / 255.0
     expected = np.asarray(expected, dtype=np.float32) / 255.0
-    if actual.shape != expected.shape or not np.isfinite(actual).all():
-        raise RuntimeError("Invalid output from the selected transformer backend")
-    rmse = float(np.sqrt(np.mean((actual - expected) ** 2)))
-    if rmse > MAX_PIXEL_RMSE:
-        raise RuntimeError(f"Selected backend differs from baseline: RMSE={rmse}")
-    logger.info("Selected backend output validated: pixel RMSE=%.6f", rmse)
+    if (
+        actual.shape != expected.shape
+        or actual.ndim != 3
+        or actual.shape[-1] != 3
+        or min(actual.shape[:2]) < 11
+        or not np.isfinite(actual).all()
+        or not np.isfinite(expected).all()
+    ):
+        raise RuntimeError("SSIM requires matching, finite RGB images at least 11x11")
+    score = float(
+        structural_similarity(
+            expected,
+            actual,
+            data_range=1.0,
+            channel_axis=-1,
+            gaussian_weights=True,
+            sigma=1.5,
+            use_sample_covariance=False,
+        )
+    )
+    if not np.isfinite(score):
+        raise RuntimeError("Nonfinite SSIM from the selected transformer backend")
+    return score

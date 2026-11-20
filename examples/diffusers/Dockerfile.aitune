@@ -65,4 +65,5 @@ RUN uv pip install 'aitune[torch211]==0.6.0' 'torch==2.11.0' \
 ENV AITUNE_CACHE_DIR=/root/.cache/huggingface/aitune
 ENV TORCHINDUCTOR_CACHE_DIR=/root/.cache/huggingface/inductor
 ENV TRITON_CACHE_DIR=/root/.cache/huggingface/triton
+RUN uv pip install scikit-image==0.26.0
 COPY . /opt/app/

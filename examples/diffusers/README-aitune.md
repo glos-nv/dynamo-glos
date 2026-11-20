@@ -9,6 +9,17 @@ AI Tune optimizes inference execution; it does not train model weights.
 Tuning runs offline. The server either loads a saved AI Tune artifact or uses
 `torch.compile` without AI Tune. It never tunes during startup.
 
+Choose the workflow after building the same image:
+
+| Goal | Entry point | Result |
+| --- | --- | --- |
+| Tune and serve | [Tune offline](#tune-offline), then [start the server](#start-the-server) | AI Tune selects a backend and saves an artifact; the server loads it for generation and editing |
+| Compare configurations | [Benchmark all configurations](#benchmark-all-configurations) | The matrix tunes each precision/backend separately, starts servers, and prints and saves comparison tables |
+
+Benchmarking is optional for serving. Both workflows use the same tuning
+implementation and artifact format. An artifact saved by either workflow can
+be passed directly to `flux_image_worker.py --artifact-dir`.
+
 ### Build
 
 From the repository root:
@@ -64,10 +75,31 @@ as an optimized artifact. Each attempt records overall tuning time and backend
 build times in `runs/<run>/tuning.json`; the manifest records successful results.
 
 Image checks compare generation, editing, and a held-out prompt with eager at
-the same precision and seeds. The pixel RMSE limit is 0.05 on values scaled to
-[0, 1]. Image mismatches are logged and saved as `Validation: FAIL`, but the
+the same precision and seeds. Image agreement uses RGB structural similarity
+(SSIM), averaged across channels with an 11-pixel Gaussian window (sigma 1.5),
+population covariance, and pixel values scaled to [0, 1]. Every case must have
+SSIM at least `--min-ssim` (default `0.90`, supported by both tuning and benchmark
+commands). This default is a starting point to calibrate against reviewed image
+pairs, not a universal image-quality threshold. Scores and the threshold are
+saved under `image_validation` in the JSON report and artifact manifest.
+Image mismatches are logged and saved as `Validation: FAIL`, but the
 compiled artifact is still published. The command exits with status 1 for a
 mismatch; the printed artifact path remains usable and serving logs a warning.
+
+CLIPScore additionally measures prompt alignment for each eager/tuned image pair.
+It reports `100 * max(cosine(image_embedding, text_embedding), 0)`, on a 0–100
+scale, plus the tuned-minus-eager difference. The scorer uses
+`openai/clip-vit-base-patch32` at a pinned revision, with standard CLIP image/text
+preprocessing, FP32 inference, and CPU execution after image validation.
+No extra Python package is required; the first run downloads the CLIP weights
+into the Hugging Face cache. Cache them before using offline mode.
+
+CLIPScore has no pass/fail threshold and does not affect SSIM validation, artifact
+saving, or benchmarks. Download/scoring errors are logged and shown in the report.
+Editing scores use the edit instruction, so they do not assess preservation of
+the reference image. Scores, prompts, model revision, and scoring duration are
+saved under `clip_score` in reports and the artifact manifest. Overall tuning
+time includes CLIP loading/scoring; backend build and server timings exclude it.
 
 ### Start the server
 
@@ -169,15 +201,29 @@ and serialized in one process. That process exits before a fresh server loads
 the artifact and is benchmarked through Dynamo HTTP. Image mismatches do not
 block benchmarks. Compilation failures and eager fallback do.
 
+The matrix calls `tune_flux.run_tuning()`, the same function used by the
+standalone `tune_flux.py` command, with one default backend selected per case.
+Both paths share precision loading, workload recording, compilation, SSIM and
+CLIP scoring, and artifact saving. Benchmark servers use the same
+`FluxImageBackend` artifact loading, warmup, and request handling as the public
+worker; only the diagnostic eager baseline bypasses compilation.
+
 The script prints and saves these tables:
 
 | Table | Measurement |
 | --- | --- |
-| Checks | Compilation, generation, editing, validation, artifact save, startup, and benchmark status |
+| Checks | Compilation, generation, editing, validation, lowest measured SSIM, artifact save, startup, and benchmark status |
+| CLIPScore | Eager/tuned prompt alignment and their difference for each validation case; diagnostic only |
 | HTTP latency | Mean/P50/P95 milliseconds from request send through complete response transfer |
 | Throughput | Successful images/second, first measured send to last complete response |
 | Generation time | Mean/P50/P95 milliseconds for the synchronized worker pipeline call, excluding PNG encoding and transport |
 | Tuning and startup | Overall tuning, backend builds, model loading, warmup, startup compilation, and total server startup, in seconds |
+
+HTTP latency, generation time, and throughput also have summary tables with
+precisions as rows and backends as columns, printed and saved in `results.md`.
+Cells show mean latency/generation time or the run's aggregate images/second.
+Unavailable benchmarks show `--`. Validation failures retain their measured
+values; consult the detailed tables for validation and benchmark status.
 
 The timing table separates **Server mode** (`AI Tune`, `No AI Tune`, or
 `Diagnostic eager`) from **Compilation type** (`AoT`, `JIT`, or `None`).

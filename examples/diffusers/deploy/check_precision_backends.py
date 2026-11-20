@@ -33,6 +33,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from tune_flux import DEFAULT_MIN_SSIM
+
 STAGES = (
     "load",
     "compile",
@@ -104,7 +106,11 @@ def _discover(path):
 
 
 def _run_tune_case(path):
-    """Tune and serialize in a process that exits before server startup."""
+    """Call the standalone tuner's shared implementation for one candidate.
+
+    Only candidate selection and report destination differ from normal tuning.
+    Exit this process before starting the server, which loads the saved artifact.
+    """
     from tune_flux import run_tuning
 
     row = json.loads(path.read_text())
@@ -114,6 +120,7 @@ def _run_tune_case(path):
         size=row["size"],
         steps=row["steps"],
         backend_id=row["backend"]["id"],
+        min_ssim=row["min_ssim"],
         report=row,
         report_path=path,
         started=float(os.environ["FLUX_PROCESS_STARTED_AT"]),
@@ -223,7 +230,28 @@ def _table(columns, records):
     )
 
 
+def _precision_backend_table(rows, values):
+    """Pivot formatted values into precision rows and distinct backend columns."""
+    precisions = dict.fromkeys(row["precision"] for row in rows)
+    backends = {row["backend"]["id"]: row["backend"]["name"] for row in rows}
+    cells = {
+        (row["precision"], row["backend"]["id"]): value
+        for row, value in zip(rows, values, strict=True)
+    }
+    return _table(
+        ("Precision", *backends.values()),
+        [
+            (
+                precision,
+                *(cells.get((precision, backend), "--") for backend in backends),
+            )
+            for precision in precisions
+        ],
+    )
+
+
 def _metric_tables(rows):
+    """Render detailed benchmarks and precision/backend summaries of their means."""
     tables = []
     for title, metric in (
         ("HTTP latency (ms)", "latency_s"),
@@ -267,6 +295,11 @@ def _metric_tables(rows):
             + _table(
                 ("Precision", "Backend", *headings, "Validation", "Benchmark"), records
             )
+        )
+        summary_title = title if throughput else f"{title}, mean"
+        tables.append(
+            f"### {summary_title} — precision/backend summary\n\n"
+            + _precision_backend_table(rows, [record[2] for record in records])
         )
     return "\n\n".join(tables)
 
@@ -331,7 +364,47 @@ def _startup_table(rows):
     )
 
 
+def _clip_table(rows):
+    """Show prompt alignment separately from SSIM and execution success."""
+    records = []
+    for row in rows:
+        result = row.get("clip_score", {})
+        scores = result.get("cases", {})
+        for label, values in scores.items():
+            records.append(
+                (
+                    row["precision"],
+                    row["backend"]["name"],
+                    label,
+                    f"{values['eager']:.4f}",
+                    f"{values['tuned']:.4f}",
+                    f"{values['delta']:+.4f}",
+                    "OK",
+                )
+            )
+        if not scores or result.get("status") == "ERROR":
+            records.append(
+                (
+                    row["precision"],
+                    row["backend"]["name"],
+                    "--",
+                    "--",
+                    "--",
+                    "--",
+                    result.get("status", "NOT RUN"),
+                )
+            )
+    return "### CLIPScore prompt alignment (0–100, diagnostic only)\n\n" + _table(
+        ("Precision", "Backend", "Case", "Eager", "Tuned", "Delta", "Scoring"),
+        records,
+    )
+
+
 def _report(directory, metadata, rows):
+    def lowest_ssim(row):
+        scores = row.get("image_validation", {}).get("scores", {})
+        return f"{min(scores.values()):.6f}" if scores else "--"
+
     columns = (
         "Precision",
         "Backend",
@@ -339,6 +412,7 @@ def _report(directory, metadata, rows):
         "Generation",
         "Editing",
         "Validation",
+        "Lowest SSIM",
         "Artifact",
         "Startup",
         "Benchmark",
@@ -352,6 +426,7 @@ def _report(directory, metadata, rows):
             row["generation"],
             row["editing"],
             row["validation"],
+            lowest_ssim(row),
             row["artifact"],
             row["startup"],
             row["benchmark"],
@@ -362,6 +437,7 @@ def _report(directory, metadata, rows):
     table = _table(columns, records)
     metrics = _metric_tables(rows)
     startup = _startup_table(rows)
+    clip = _clip_table(rows)
     details = "\n".join(
         f"- {row['precision']} / {row['backend']['name']}: {row['error']}"
         + (
@@ -377,6 +453,11 @@ def _report(directory, metadata, rows):
         for row in rows
         for failure in row.get("validation_errors", [])
     )
+    clip_errors = "\n".join(
+        f"- {row['precision']} / {row['backend']['name']} / CLIPScore: {row['clip_score']['error']}"
+        for row in rows
+        if row.get("clip_score", {}).get("error")
+    )
     report = (
         f"GPU: {metadata['gpu']}\n\n"
         f"Workload: {rows[0]['size']}, {rows[0]['steps']} steps, batch size 1.\n\n"
@@ -385,6 +466,14 @@ def _report(directory, metadata, rows):
         "Compile includes AI Tune build, checks, and profiling. Eager fallback "
         "does not count as success. Validation compares images with eager at "
         "the same precision; it is not a comparison with BF16.\n\n"
+        f"Image agreement requires RGB SSIM >= {rows[0]['min_ssim']:.6f} for every case. "
+        "Lowest SSIM is the minimum measured generation, editing, or held-out score. "
+        "This is a similarity check, not a general image-quality assessment.\n\n"
+        f"{clip}\n\n"
+        "CLIPScore is diagnostic prompt alignment; delta is tuned minus eager. "
+        "Scores use a fixed CLIP checkpoint on CPU during offline tuning, outside "
+        "backend profiling and server benchmarks. Editing scores use the edit instruction, "
+        "which is not a full description of the image. No CLIPScore threshold is applied.\n\n"
         f"{metrics}\n\n"
         f"{startup}\n\n"
         f"Compiler cache policy: {rows[0]['compiler_cache']}. Startup is measured in a fresh process "
@@ -399,11 +488,12 @@ def _report(directory, metadata, rows):
         "work between requests and is not a maximum-concurrency measurement.\n\n"
         "Image validation failures do not block diagnostic benchmarks; consult "
         "the Validation column before interpreting performance results.\n\n"
-        f"{details}\n{validation_details}\n"
+        f"{details}\n{validation_details}\n{clip_errors}\n"
     )
     (directory / "results.md").write_text(report)
     _write_json(directory / "results.json", {"environment": metadata, "results": rows})
     print(table, flush=True)
+    print("\n" + clip, flush=True)
     print("\n" + metrics, flush=True)
     print("\n" + startup, flush=True)
 
@@ -437,6 +527,12 @@ def main():
     parser.add_argument("--size", default="1024x1024")
     parser.add_argument("--steps", type=int, choices=range(1, 51), default=4)
     parser.add_argument(
+        "--min-ssim",
+        type=float,
+        default=DEFAULT_MIN_SSIM,
+        help="Minimum RGB SSIM for image agreement (default: %(default)s)",
+    )
+    parser.add_argument(
         "--benchmark-requests",
         type=int,
         default=10,
@@ -461,6 +557,8 @@ def main():
     parser.add_argument("--_tune-case", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--_serve-case", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not 0 <= args.min_ssim <= 1:
+        parser.error("--min-ssim must be between 0 and 1")
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
@@ -527,6 +625,7 @@ def main():
                 backend=backend,
                 size=args.size,
                 steps=args.steps,
+                min_ssim=args.min_ssim,
                 benchmark_options={
                     "size": args.size,
                     "steps": args.steps,

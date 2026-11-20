@@ -24,6 +24,7 @@ from pathlib import Path
 from flux_artifacts import save_artifact, write_json
 
 logger = logging.getLogger(__name__)
+DEFAULT_MIN_SSIM = 0.90
 
 
 def run_tuning(
@@ -35,18 +36,24 @@ def run_tuning(
     model=None,
     backend_id=None,
     max_image_side=2048,
+    min_ssim=DEFAULT_MIN_SSIM,
     report=None,
     report_path=None,
     started=None,
 ):
     """Run a new tuning attempt even if a previous artifact exists.
 
+    Shared by the standalone tuning CLI and the precision/backend benchmark.
+    With no backend_id, select among all AI Tune defaults; the benchmark passes
+    one candidate ID per case. Both produce the same load-only serving artifact.
     Each attempt has its own build directory. The root manifest is published
     only after checkpoint saving succeeds, so an unsuccessful attempt leaves
     an existing artifact intact. Image mismatches are warnings in the artifact.
     Overall tuning time includes loading, recording, backend builds/profiling,
-    image checks, and checkpoint serialization/integrity indexing.
+    SSIM/CLIP image checks, and checkpoint serialization/integrity indexing.
     """
+    if not 0 <= min_ssim <= 1:
+        raise ValueError("min_ssim must be between 0 and 1")
     started = time.perf_counter() if started is None else started
     artifact_dir = Path(artifact_dir).resolve()
     run_directory = artifact_dir / "runs" / uuid.uuid4().hex
@@ -96,6 +103,7 @@ def run_tuning(
             progress=progress,
             output_dir=run_directory,
             backend_id=backend_id,
+            min_ssim=min_ssim,
         )
         report["phase"] = "artifact"
         progress()
@@ -113,6 +121,8 @@ def run_tuning(
                 },
                 "validation": report["validation"],
                 "validation_errors": report.get("validation_errors", []),
+                "image_validation": report["image_validation"],
+                "clip_score": report["clip_score"],
                 "backend_builds": report["backend_builds"],
                 "compilation_seconds": report.get("compilation_seconds", 0),
             },
@@ -161,10 +171,18 @@ def main():
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--max-image-side", type=int, default=2048)
     parser.add_argument(
+        "--min-ssim",
+        type=float,
+        default=DEFAULT_MIN_SSIM,
+        help="Minimum RGB SSIM for image agreement (default: %(default)s)",
+    )
+    parser.add_argument(
         "--backend",
         help="Optional default-candidate ID from check_precision_backends.py --list-backends",
     )
     args = parser.parse_args()
+    if not 0 <= args.min_ssim <= 1:
+        parser.error("--min-ssim must be between 0 and 1")
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
@@ -177,6 +195,7 @@ def main():
         model=args.model,
         backend_id=args.backend,
         max_image_side=args.max_image_side,
+        min_ssim=args.min_ssim,
         started=started,
     )
     return int(report["status"] == "FAIL")
